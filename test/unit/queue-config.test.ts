@@ -1,0 +1,37 @@
+import { describe, expect, it } from "vitest";
+import {
+  QUEUE_DEFINITIONS,
+  QUEUE_NAMES,
+  singletonKeys,
+} from "../../src/queues/queue-config.js";
+
+describe("queue families + policies", () => {
+  // Test 35 (unit portion): send_message has ZERO automatic retries.
+  it("send_message retryLimit is exactly 0", () => {
+    expect(QUEUE_DEFINITIONS[QUEUE_NAMES.sendMessage].retryLimit).toBe(0);
+    expect(QUEUE_DEFINITIONS[QUEUE_NAMES.sendMessage].retryBackoff).toBe(false);
+  });
+
+  it("sync_mailbox retries with bounded exponential backoff (max ~5)", () => {
+    const q = QUEUE_DEFINITIONS[QUEUE_NAMES.syncMailbox];
+    expect(q.retryLimit).toBe(5);
+    expect(q.retryBackoff).toBe(true);
+    expect(q.retryDelayMax).toBeGreaterThan(0);
+  });
+
+  it("draft_mirror retries max ~3", () => {
+    expect(QUEUE_DEFINITIONS[QUEUE_NAMES.draftMirror].retryLimit).toBe(3);
+  });
+
+  it("apply_mutation allows bounded retries", () => {
+    expect(
+      QUEUE_DEFINITIONS[QUEUE_NAMES.applyMutation].retryLimit,
+    ).toBeGreaterThan(0);
+  });
+
+  it("builds deterministic idempotency/dedup keys", () => {
+    expect(singletonKeys.sendMessage("intent-1")).toBe("send:intent-1");
+    expect(singletonKeys.draftMirror("d1", "3")).toBe("draft:d1:3");
+    expect(singletonKeys.syncMailbox("mb", "INBOX")).toBe("sync:mb:INBOX");
+  });
+});
