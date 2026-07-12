@@ -1,0 +1,117 @@
+name: CI
+
+# Transport worker CI. NOT a scheduler/runtime — this only builds and tests.
+# Least privilege: read-only checkout token; no deploy steps; no secrets used.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22.22.2"
+  PNPM_VERSION: "10.33.0"
+  # The canonical schema is owned by the sibling UI repo at this merged SHA.
+  # Full 40-char SHA: actions/checkout cannot fetch an abbreviated ref.
+  UI_REPO_REF: "67daad9fa9199eec0039b27a972e706259737a5d"
+  EXPECTED_TRANSPORT_SHA: "a2319ada8d471d09063b8e2bfbdb8c814e4ba49cecdee08c9bbd9b800aa8c72a"
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout backend
+        uses: actions/checkout@v4
+
+      - name: Checkout canonical schema (sibling UI repo, pinned SHA)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/E-Mail-Composer-UI
+          ref: ${{ env.UI_REPO_REF }}
+          path: ui-schema
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install PostgreSQL 16 server binaries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-16
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Format check
+        run: pnpm format:check
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit tests
+        run: pnpm test
+
+      - name: Coverage (thresholds enforced)
+        run: pnpm test:coverage
+
+      - name: Build
+        run: pnpm build
+
+      - name: Prod dependency audit (high)
+        run: pnpm audit --prod --audit-level high
+
+      - name: License policy check (no AGPL / non-permissive)
+        run: pnpm run license:check
+
+      - name: Verify canonical migration checksum
+        run: |
+          actual="$(sha256sum ui-schema/supabase/migrations/20260713100000_transport_foundation.sql | awk '{print $1}')"
+          if [ "$actual" != "$EXPECTED_TRANSPORT_SHA" ]; then
+            echo "Migration checksum mismatch: $actual != $EXPECTED_TRANSPORT_SHA"; exit 1
+          fi
+
+      - name: Start local Postgres + load canonical schema
+        run: UI_REPO="$GITHUB_WORKSPACE/ui-schema" bash scripts/test-db.sh --print
+
+      - name: Local Postgres + pg-boss integration
+        env:
+          TEST_DATABASE_URL: postgresql://postgres@localhost:54330/transport_test
+          TEST_WORKER_DATABASE_URL: postgresql://transport_worker:worker_test_pw@localhost:54330/transport_test
+        run: pnpm test:integration
+
+      - name: Fake IMAP integration (sync + IDLE, no network)
+        run: pnpm vitest run --project unit test/unit/sync-executor.test.ts
+
+      - name: Fake SMTP integration (send path, no network)
+        run: pnpm vitest run --project unit test/unit/send-executor.test.ts
+
+      - name: Failure-injection tests (pre-DATA / ambiguous / restart safety)
+        run: pnpm vitest run --project unit -t "ambiguous|pre-DATA|restart|failed before|sent_copy_pending|claim"
+
+      - name: Secret scan
+        run: pnpm run secret:scan
+
+      - name: git diff --check (whitespace / conflict markers)
+        run: git diff --check
+
+      - name: Teardown throwaway Postgres
+        if: always()
+        run: bash scripts/test-db.sh --stop || true
