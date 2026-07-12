@@ -1,0 +1,14 @@
+node_modules
+dist
+coverage
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+# Test-only Postgres cluster data dirs (see scripts/test-db.sh).
+/tmp/pg-*
+*.log
+# Never commit plaintext credential material or key files.
+*.key
+*.pem
+secrets/
