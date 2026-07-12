@@ -1,0 +1,51 @@
+{
+  "name": "e-mail-composer-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "dist/entrypoints/worker.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist",
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run --project unit",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --project unit --coverage",
+    "test:integration": "vitest run --project integration",
+    "test:db": "bash scripts/test-db.sh",
+    "license:check": "node scripts/license-check.mjs",
+    "secret:scan": "bash scripts/secret-scan.sh",
+    "audit:prod": "pnpm audit --prod --audit-level high",
+    "provision:credential": "tsx src/entrypoints/provision-credential.ts",
+    "worker": "tsx src/entrypoints/worker.ts",
+    "start": "node dist/entrypoints/worker.js"
+  },
+  "dependencies": {
+    "imapflow": "1.4.7",
+    "mailparser": "3.9.14",
+    "nodemailer": "9.0.3",
+    "pg": "8.22.0",
+    "pg-boss": "12.26.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.0",
+    "@types/mailparser": "3.4.6",
+    "@types/node": "22.20.1",
+    "@types/nodemailer": "8.0.1",
+    "@types/pg": "8.20.0",
+    "@vitest/coverage-v8": "4.1.10",
+    "eslint": "9.39.5",
+    "prettier": "3.9.5",
+    "tsx": "4.23.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.46.0",
+    "vitest": "4.1.10"
+  }
+}

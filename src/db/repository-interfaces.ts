@@ -1,0 +1,123 @@
+import type {
+  DraftMirrorRow,
+  MailboxFolderRow,
+  MailboxRow,
+  MailMessageMeta,
+  SendAttemptRow,
+  SendIntentRow,
+  StoredCredential,
+} from "../domain/models.js";
+import type { SendState } from "../domain/send-state.js";
+
+/**
+ * Repository ports. Both the `pg`-backed implementations (repositories.ts) and
+ * the in-memory test fakes implement these, so executors are unit-testable with
+ * no database and integration-testable against real Postgres.
+ */
+
+export interface MailboxReader {
+  getById(id: string): Promise<MailboxRow | null>;
+  listEnabled(): Promise<MailboxRow[]>;
+}
+
+export interface CredentialReader {
+  getActiveByMailbox(mailboxId: string): Promise<StoredCredential | null>;
+}
+
+export interface FolderStore {
+  upsertDiscovered(input: {
+    workspaceId: string;
+    mailboxId: string;
+    name: string;
+    role: MailboxFolderRow["role"];
+    uidvalidity: bigint;
+    uidnext: bigint;
+  }): Promise<MailboxFolderRow>;
+  getByMailboxAndName(
+    mailboxId: string,
+    name: string,
+  ): Promise<MailboxFolderRow | null>;
+  updateCursor(input: {
+    id: string;
+    uidvalidity: bigint;
+    uidnext: bigint;
+    lastSeenUid: bigint;
+    highestModseq: bigint | null;
+  }): Promise<void>;
+  resetForUidValidityChange(input: {
+    id: string;
+    newUidvalidity: bigint;
+    newUidnext: bigint;
+  }): Promise<void>;
+}
+
+export interface MessageStore {
+  upsertMeta(m: MailMessageMeta): Promise<void>;
+  countByFolder(folderId: string): Promise<number>;
+}
+
+export interface DraftMirrorStore {
+  getByDraftAndMailbox(
+    draftId: string,
+    mailboxId: string,
+  ): Promise<DraftMirrorRow | null>;
+  upsert(input: {
+    workspaceId: string;
+    draftId: string;
+    mailboxId: string;
+    remoteUid: bigint | null;
+    remoteUidvalidity: bigint | null;
+    mirroredRevision: bigint;
+    status: DraftMirrorRow["status"];
+  }): Promise<DraftMirrorRow>;
+}
+
+export interface SendIntentReader {
+  getById(id: string): Promise<SendIntentRow | null>;
+}
+
+export interface SendAttemptStore {
+  getById(id: string): Promise<SendAttemptRow | null>;
+  getBySendIntent(sendIntentId: string): Promise<SendAttemptRow | null>;
+  compareAndSet(input: {
+    id: string;
+    expectedVersion: bigint;
+    expectedState: SendState;
+    toState: SendState;
+    fields?: {
+      claimedBy?: string | null;
+      claimedAt?: Date | null;
+      messageId?: string | null;
+      smtpResponse?: string | null;
+      evidence?: Record<string, string | number | boolean>;
+    };
+  }): Promise<SendAttemptRow | null>;
+}
+
+export interface WorkerClaimStore {
+  tryClaim(input: {
+    sendAttemptId: string;
+    workerId: string;
+    leaseUntil: Date;
+  }): Promise<boolean>;
+  heartbeat(sendAttemptId: string, leaseUntil: Date): Promise<void>;
+  release(sendAttemptId: string): Promise<void>;
+  expireStale(now: Date): Promise<number>;
+}
+
+export interface AuditWriter {
+  append(input: {
+    workspaceId: string;
+    mailboxId?: string | null;
+    eventType: string;
+    sendIntentId?: string | null;
+    sendAttemptId?: string | null;
+    correlationId?: string | null;
+    messageId?: string | null;
+    detail?: Record<string, string | number | boolean>;
+  }): Promise<void>;
+}
+
+export interface HeartbeatWriter {
+  beat(workerId: string, state: string | null): Promise<void>;
+}
