@@ -16,7 +16,7 @@ import type { SmtpClient, SmtpSendCommand, SmtpSendResult } from "./ports.js";
  * When in doubt we choose AMBIGUOUS (the safe, no-resend classification).
  */
 
-interface NodemailerError extends Error {
+export interface NodemailerError extends Error {
   code?: string;
   responseCode?: number;
   command?: string;
@@ -31,7 +31,8 @@ const PRE_DATA_CODES = new Set([
   "EPROTOCOL",
 ]);
 
-function classify(err: NodemailerError, command: string): never {
+/** Exported for unit tests that pin the classification table (T1). */
+export function classify(err: NodemailerError, command: string): never {
   const code = err.code ?? "";
   // If the failing command is known to be before DATA, it's a clean pre-DATA
   // failure. Nodemailer sets `command` on envelope/greeting errors.

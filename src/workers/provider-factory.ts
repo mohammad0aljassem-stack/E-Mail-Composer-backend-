@@ -72,6 +72,22 @@ export class ImapSmtpProviderFactory implements ProviderFactory {
         "mailbox missing host/port config",
       );
     }
+    // Fail-closed transport security: a mailbox row whose imap_security or
+    // smtp_security is 'none' (or unset) must NEVER produce a cleartext
+    // session that would carry the credential and message bytes in plaintext.
+    // Checked BEFORE any credential is read or decrypted.
+    if (mailbox.imapSecurity === "none" || mailbox.imapSecurity === null) {
+      throw new TransportError(
+        "config_invalid",
+        "mailbox imap_security must be ssl or starttls (plaintext refused)",
+      );
+    }
+    if (mailbox.smtpSecurity === "none" || mailbox.smtpSecurity === null) {
+      throw new TransportError(
+        "config_invalid",
+        "mailbox smtp_security must be ssl or starttls (plaintext refused)",
+      );
+    }
     const stored = await this.deps.credentials.getActiveByMailbox(mailbox.id);
     if (stored === null) {
       throw new TransportError("credential_missing", "no active credential");
@@ -103,10 +119,14 @@ export class ImapSmtpProviderFactory implements ProviderFactory {
       zeroBuffer(plaintext); // best-effort scrub after parse
     }
 
+    // NOTE: IMAP "starttls" currently maps to implicit TLS (secure=true) — the
+    // client does not negotiate STARTTLS upgrade yet. This is deliberately
+    // fail-closed: the session is ALWAYS encrypted, never plaintext. 'none'
+    // was rejected above.
     const imap = new ImapFlowClient({
       host: mailbox.imapHost,
       port: mailbox.imapPort,
-      secure: mailbox.imapSecurity !== "none",
+      secure: true,
       auth: { user: cred.user, pass: cred.pass },
       timeoutMs: this.deps.config.imapCommandTimeoutMs,
     });

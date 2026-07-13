@@ -365,10 +365,18 @@ function parseSendMessageRetryLimit() {
   return m === null ? null : Number(m[1]);
 }
 
-/** Read the MAIL_TRANSPORT_V1_ENABLED default from env.ts (true/false). */
+/**
+ * Read the MAIL_TRANSPORT_V1_ENABLED default from env.ts (true/false).
+ * Matches both call shapes of the strict bool() parser:
+ *   bool(env.MAIL_TRANSPORT_V1_ENABLED, false)
+ *   bool(env.MAIL_TRANSPORT_V1_ENABLED, false, "MAIL_TRANSPORT_V1_ENABLED")
+ * The default is the FIRST true/false after the env-var reference.
+ */
 function parseTransportFlagDefault() {
   const src = readText("src/config/env.ts");
-  const m = /MAIL_TRANSPORT_V1_ENABLED\s*,\s*(true|false)\s*\)/.exec(src);
+  const m = /env\.MAIL_TRANSPORT_V1_ENABLED\s*,\s*(true|false)\s*[,)]/.exec(
+    src,
+  );
   if (m === null) return null;
   return m[1] === "true";
 }

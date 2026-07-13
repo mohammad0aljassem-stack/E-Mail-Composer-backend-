@@ -11,6 +11,7 @@ import type {
 import type { SendState } from "../../src/domain/send-state.js";
 import {
   FakeAuditRepo,
+  FakeFolderRepo,
   FakeMailboxRepo,
   FakeSendAttemptRepo,
   FakeSendIntentRepo,
@@ -36,6 +37,7 @@ interface Harness {
   attempts: FakeSendAttemptRepo;
   audit: FakeAuditRepo;
   claims: FakeWorkerClaimRepo;
+  folders: FakeFolderRepo;
   smtp: FakeSmtpClient;
   server: FakeImapServer;
   factory: FakeProviderFactory;
@@ -48,8 +50,9 @@ async function makeHarness(options?: {
   payloadOverride?: ResolvedSendPayload;
   globalKillSwitch?: boolean;
   mailboxOverrides?: Parameters<typeof sendableMailbox>[0];
+  fixtureOptions?: Parameters<typeof buildFixture>[0];
 }): Promise<Harness> {
-  const fixture = await buildFixture();
+  const fixture = await buildFixture(options?.fixtureOptions);
   const mailboxes = new FakeMailboxRepo();
   mailboxes.rows.set(
     fixture.intent.mailboxId,
@@ -61,6 +64,7 @@ async function makeHarness(options?: {
   attempts.rows.set(ATTEMPT_ID, fixture.attempt("confirmed"));
   const claims = new FakeWorkerClaimRepo();
   const audit = new FakeAuditRepo();
+  const folders = new FakeFolderRepo();
 
   const server = new FakeImapServer();
   server.addFolder({ name: "Sent", role: "sent" });
@@ -81,6 +85,7 @@ async function makeHarness(options?: {
     intents,
     attempts,
     mailboxes,
+    folders,
     claims,
     audit,
     providerFactory: factory,
@@ -100,6 +105,7 @@ async function makeHarness(options?: {
     attempts,
     audit,
     claims,
+    folders,
     smtp,
     server,
     factory,
@@ -378,6 +384,216 @@ describe("SendExecutor — authoritative sender at execution (B5)", () => {
     expect(h.smtp.submissions).toHaveLength(0);
     expect(h.attempts.rows.get(ATTEMPT_ID)?.evidence.reason).toBe(
       "sender_authority_workspace_mismatch",
+    );
+  });
+});
+
+describe("SendExecutor — partial RCPT rejection (C1)", () => {
+  const partialHarness = () =>
+    makeHarness({
+      fixtureOptions: {
+        recipients: {
+          to: [
+            "recipient@example.com",
+            "second@example.com",
+            "third@example.com",
+          ],
+        },
+      },
+    });
+
+  it("routes a partial rejection to needs_human_review, never completed", async () => {
+    const h = await partialHarness();
+    h.smtp.behavior = "partial_reject";
+    const outcome = await h.exec.execute(JOB);
+    expect(outcome).toBe("needs_human_review");
+    const row = h.attempts.rows.get(ATTEMPT_ID)!;
+    expect(row.state).toBe("needs_human_review");
+    // The message WAS transmitted to the accepted subset: exactly ONE submission.
+    expect(h.smtp.submissions).toHaveLength(1);
+    expect(row.evidence.reason).toBe("rcpt_partial_rejection");
+    expect(row.evidence.accepted_count).toBe(1);
+    expect(row.evidence.rejected_count).toBe(2);
+  });
+
+  it("never retries or re-enqueues after a partial rejection", async () => {
+    const h = await partialHarness();
+    h.smtp.behavior = "partial_reject";
+    await h.exec.execute(JOB);
+    // A duplicate job sees the terminal needs_human_review state: no new SMTP.
+    const second = await h.exec.execute(JOB);
+    expect(second).toBe("skipped_terminal");
+    expect(h.smtp.submissions).toHaveLength(1);
+  });
+
+  it("keeps partial-rejection evidence content-free (counts, never addresses)", async () => {
+    const h = await partialHarness();
+    h.smtp.behavior = "partial_reject";
+    await h.exec.execute(JOB);
+    const row = h.attempts.rows.get(ATTEMPT_ID)!;
+    const evidence = JSON.stringify(row.evidence);
+    expect(evidence).not.toContain("example.com");
+    expect(evidence).not.toContain("recipient");
+    expect(evidence).not.toContain("second");
+    expect(evidence).not.toContain("third");
+    // The audit detail is equally content-free.
+    const review = h.audit.events.find(
+      (e) => e.eventType === "send_needs_human_review",
+    );
+    expect(review).toBeDefined();
+    expect(JSON.stringify(review?.detail ?? {})).not.toContain("example.com");
+  });
+
+  it("full acceptance of multiple recipients still completes (unchanged)", async () => {
+    const h = await partialHarness();
+    const outcome = await h.exec.execute(JOB);
+    expect(outcome).toBe("completed");
+    expect(h.smtp.submissions).toHaveLength(1);
+    expect(h.smtp.submissions[0]?.envelopeTo).toHaveLength(3);
+  });
+});
+
+describe("SendExecutor — Sent folder resolved from discovery (C3)", () => {
+  it("appends the Sent copy to the discovered localized sent-role folder", async () => {
+    const h = await makeHarness();
+    h.server.addFolder({ name: "Gesendete Objekte", role: "sent" });
+    await h.folders.upsertDiscovered({
+      workspaceId: WORKSPACE_ID,
+      mailboxId: h.fixture.intent.mailboxId,
+      name: "Gesendete Objekte",
+      role: "sent",
+      uidvalidity: 1n,
+      uidnext: 1n,
+    });
+    const outcome = await h.exec.execute(JOB);
+    expect(outcome).toBe("completed");
+    const localized = [
+      ...h.server.folder("Gesendete Objekte").messages.values(),
+    ];
+    expect(localized.some((m) => m.messageId === MESSAGE_ID)).toBe(true);
+    // Nothing went into the hard-coded default.
+    expect(h.server.folder("Sent").messages.size).toBe(0);
+  });
+
+  it("falls back to the configured default when no sent-role folder exists", async () => {
+    const h = await makeHarness(); // folder repo has NO sent-role row
+    const outcome = await h.exec.execute(JOB);
+    expect(outcome).toBe("completed");
+    const sent = [...h.server.folder("Sent").messages.values()];
+    expect(sent.some((m) => m.messageId === MESSAGE_ID)).toBe(true);
+  });
+});
+
+describe("SendExecutor — stale-claim recovery is conservative (C7)", () => {
+  it("yields claim_lost with zero SMTP for a claimed attempt after lease expiry", async () => {
+    const h = await makeHarness();
+    // A crashed worker left the attempt in `claimed` with a stale claim row.
+    h.setState("claimed", 3n);
+    await h.claims.tryClaim({
+      sendAttemptId: ATTEMPT_ID,
+      workerId: "crashed-worker",
+      leaseUntil: new Date(Date.now() - 60_000), // already expired
+    });
+    const expired = await h.claims.expireStale(new Date());
+    expect(expired).toBe(1);
+    // The normal path never resumes delivery from `claimed`: the attempt must
+    // be re-driven through its ordinary claim + state flow. No silent send.
+    const outcome = await h.exec.execute(JOB);
+    expect(outcome).toBe("claim_lost");
+    expect(h.smtp.submissions).toHaveLength(0);
+    expect(h.attempts.rows.get(ATTEMPT_ID)?.state).toBe("claimed");
+  });
+});
+
+describe("SendExecutor — re-entry pins (T2/T3/T4)", () => {
+  it("T2: needs_human_review is terminal — re-entry is skipped with 0 submissions", async () => {
+    const h = await makeHarness();
+    h.setState("needs_human_review", 7n);
+    const outcome = await h.exec.execute(JOB);
+    expect(outcome).toBe("skipped_terminal");
+    expect(h.smtp.submissions).toHaveLength(0);
+    expect(h.attempts.rows.get(ATTEMPT_ID)?.state).toBe("needs_human_review");
+  });
+
+  it("T3: sent_copy_pending re-entry completes via Sent copy, 0 SMTP submissions", async () => {
+    const h = await makeHarness();
+    h.setState("sent_copy_pending", 6n);
+    const outcome = await h.exec.execute(JOB);
+    expect(outcome).toBe("completed");
+    expect(h.smtp.submissions).toHaveLength(0);
+    const sent = [...h.server.folder("Sent").messages.values()];
+    expect(sent.filter((m) => m.messageId === MESSAGE_ID)).toHaveLength(1);
+  });
+
+  it("T4: Sent-copy dedup — an existing Message-ID is never appended twice", async () => {
+    const h = await makeHarness();
+    h.server.seedMessage("Sent", { messageId: MESSAGE_ID });
+    h.setState("smtp_accepted", 5n);
+    const outcome = await h.exec.execute(JOB);
+    expect(outcome).toBe("completed");
+    expect(h.smtp.submissions).toHaveLength(0);
+    const copies = [...h.server.folder("Sent").messages.values()].filter(
+      (m) => m.messageId === MESSAGE_ID,
+    );
+    expect(copies).toHaveLength(1);
+  });
+});
+
+describe("SendExecutor — attachment-manifest mismatch (T5)", () => {
+  it("fails before delivery when the payload carries an undeclared attachment", async () => {
+    const h = await makeHarness();
+    h.deps.payloadResolver = {
+      resolve: () =>
+        Promise.resolve({
+          revision: h.fixture.payload.revision,
+          message: {
+            ...h.fixture.message,
+            attachments: [
+              {
+                filename: "undeclared.bin",
+                contentType: "application/octet-stream",
+                content: Buffer.from("not in the confirmed manifest"),
+              },
+            ],
+          },
+        }),
+    };
+    const outcome = await h.exec.execute(JOB);
+    expect(outcome).toBe("failed_before_delivery");
+    expect(h.smtp.submissions).toHaveLength(0);
+    expect(h.attempts.rows.get(ATTEMPT_ID)?.evidence.reason).toBe(
+      "attachment_manifest_mismatch",
+    );
+  });
+});
+
+describe("SendExecutor — audit-event assertions (T6)", () => {
+  it("happy path emits started -> accepted -> completed, all content-free", async () => {
+    const h = await makeHarness();
+    await h.exec.execute(JOB);
+    const types = h.audit.events.map((e) => e.eventType);
+    const started = types.indexOf("smtp_send_started");
+    const acceptedIdx = types.indexOf("smtp_accepted");
+    const completedIdx = types.indexOf("send_completed");
+    expect(started).toBeGreaterThan(-1);
+    expect(acceptedIdx).toBeGreaterThan(started);
+    expect(completedIdx).toBeGreaterThan(acceptedIdx);
+    // No event or detail carries body text or a recipient address.
+    const serialized = JSON.stringify(h.audit.events);
+    expect(serialized).not.toContain("Hello");
+    expect(serialized).not.toContain("<p>");
+    expect(serialized).not.toContain("recipient@example.com");
+  });
+
+  it("ambiguous path emits send_needs_human_review", async () => {
+    const h = await makeHarness();
+    h.smtp.behavior = "ambiguous";
+    await h.exec.execute(JOB);
+    expect(
+      h.audit.events.some((e) => e.eventType === "send_needs_human_review"),
+    ).toBe(true);
+    expect(JSON.stringify(h.audit.events)).not.toContain(
+      "recipient@example.com",
     );
   });
 });

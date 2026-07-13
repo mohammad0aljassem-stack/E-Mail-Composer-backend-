@@ -20,6 +20,7 @@ interface FakeMessage {
   uid: bigint;
   flags: Set<string>;
   messageId: string | null;
+  references: string | null;
   subject: string | null;
   from: string | null;
   to: string | null;
@@ -94,6 +95,7 @@ export class FakeImapServer {
       uid,
       flags: new Set(input.flags ?? []),
       messageId: input.messageId ?? null,
+      references: input.references ?? null,
       subject: input.subject ?? null,
       from: input.from ?? null,
       to: input.to ?? null,
@@ -213,6 +215,7 @@ export class FakeImapClient implements ImapClient {
       uid,
       flags: new Set(flags),
       messageId: parseMessageId(mime),
+      references: parseHeader(mime, "references"),
       subject: parseHeader(mime, "subject"),
       from: parseHeader(mime, "from"),
       to: parseHeader(mime, "to"),
@@ -300,7 +303,7 @@ export class FakeImapClient implements ImapClient {
       uidvalidity,
       messageId: m.messageId,
       inReplyTo: null,
-      referencesHeader: null,
+      referencesHeader: m.references,
       subject: m.subject,
       fromSummary: m.from,
       toSummary: m.to,

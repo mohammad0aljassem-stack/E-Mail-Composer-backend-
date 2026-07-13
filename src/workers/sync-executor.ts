@@ -32,7 +32,15 @@ export interface SyncExecutorDeps {
   providerFactory: ProviderFactory;
   clock: Clock;
   logger: Logger;
-  config: { batchSize: number };
+  config: {
+    batchSize: number;
+    /**
+     * Global kill switch. Dispatch already filters new work, but an
+     * already-enqueued job must ALSO refuse to open IMAP after the switch
+     * flips — checked first in execute(), before any provider is created.
+     */
+    globalKillSwitch: boolean;
+  };
 }
 
 export interface SyncJob {
@@ -59,6 +67,12 @@ export class SyncExecutor {
       folder: job.folder,
       mode: job.mode,
     });
+
+    // Global kill switch: skip content-free BEFORE any provider/IMAP contact.
+    if (this.deps.config.globalKillSwitch) {
+      log.warn("sync_skipped_global_kill_switch");
+      return { persisted: 0, uidValidityChanged: false, needsFollowUp: false };
+    }
 
     const mailbox = await this.requireSyncableMailbox(job.mailboxId);
     const provider = await this.deps.providerFactory.create(mailbox);
@@ -175,4 +189,36 @@ export class SyncExecutor {
     }
     return mailbox;
   }
+}
+
+/**
+ * Act on `SyncResult.needsFollowUp`: enqueue exactly ONE incremental sync for
+ * the same mailbox+folder so a multi-batch backlog drains instead of stalling.
+ * The mailbox+folder singletonKey dedups the enqueue; the workspace group is
+ * preserved by the enqueue implementation. Content-free logging (ids + folder
+ * name only). Called from the sync_mailbox job handler; unit-tested directly.
+ */
+export async function enqueueSyncFollowUp(input: {
+  result: SyncResult;
+  job: SyncJob;
+  enqueueSync: (job: {
+    workspaceId: string;
+    mailboxId: string;
+    folder: string;
+    mode: "incremental";
+  }) => Promise<string | null>;
+  logger: Logger;
+}): Promise<boolean> {
+  if (!input.result.needsFollowUp) return false;
+  await input.enqueueSync({
+    workspaceId: input.job.workspaceId,
+    mailboxId: input.job.mailboxId,
+    folder: input.job.folder,
+    mode: "incremental",
+  });
+  input.logger.info("sync_follow_up_enqueued", {
+    mailboxId: input.job.mailboxId,
+    folder: input.job.folder,
+  });
+  return true;
 }

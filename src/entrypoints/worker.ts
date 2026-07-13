@@ -35,7 +35,7 @@ import type {
 } from "../queues/queue-config.js";
 import { ImapSmtpProviderFactory } from "../workers/provider-factory.js";
 import { SendExecutor } from "../workers/send-executor.js";
-import { SyncExecutor } from "../workers/sync-executor.js";
+import { SyncExecutor, enqueueSyncFollowUp } from "../workers/sync-executor.js";
 import { SyncRequestDispatcher } from "../workers/sync-request-dispatcher.js";
 import { MutationExecutor } from "../workers/mutation-executor.js";
 import type { Job, JobWithMetadata } from "pg-boss";
@@ -105,13 +105,18 @@ async function main(): Promise<void> {
       providerFactory,
       clock,
       logger,
-      config: { batchSize: 200 },
+      config: {
+        batchSize: 200,
+        globalKillSwitch: config.globalKillSwitch,
+      },
     });
+    const workerClaims = new WorkerClaimRepository(db);
     const sendExec = new SendExecutor({
       intents: new SendIntentRepository(db),
       attempts: new SendAttemptRepository(db),
       mailboxes: new MailboxRepository(db),
-      claims: new WorkerClaimRepository(db),
+      folders: new FolderRepository(db),
+      claims: workerClaims,
       audit: new AuditRepository(db),
       providerFactory,
       payloadResolver: {
@@ -127,6 +132,9 @@ async function main(): Promise<void> {
         workerId: config.workerId,
         claimLeaseMs: config.claimLeaseMs,
         globalKillSwitch: config.globalKillSwitch,
+        // Fallback ONLY: the executor resolves the discovered sent-role
+        // folder per mailbox (IONOS localizes it) and uses this default when
+        // discovery has no sent-role row.
         sentFolder: "Sent",
       },
     });
@@ -135,6 +143,7 @@ async function main(): Promise<void> {
       audit: new AuditRepository(db),
       providerFactory,
       logger,
+      config: { globalKillSwitch: config.globalKillSwitch },
     });
 
     // Durable transport.sync_requests consumer/dispatcher (B3/B4). The worker
@@ -143,6 +152,7 @@ async function main(): Promise<void> {
     const dispatcher = new SyncRequestDispatcher({
       syncRequests: new SyncRequestRepository(db),
       mailboxes: new MailboxRepository(db),
+      sendClaims: workerClaims,
       enqueueSync: (job) => queues.enqueueSyncForRequest(job),
       clock,
       logger,
@@ -164,11 +174,20 @@ async function main(): Promise<void> {
         for (const job of jobs) {
           const requestId = job.data.syncRequestId;
           try {
-            await syncExec.execute(job.data);
+            const result = await syncExec.execute(job.data);
             // Mark the durable request completed ONLY after the sync completed.
             if (requestId !== undefined) {
               await dispatcher.markCompleted(requestId);
             }
+            // Multi-batch backlog: enqueue ONE incremental follow-up sync for
+            // the same mailbox+folder (deduped by the mailbox+folder
+            // singletonKey, workspace group preserved).
+            await enqueueSyncFollowUp({
+              result,
+              job: job.data,
+              enqueueSync: (followUp) => queues.enqueueSync(followUp),
+              logger,
+            });
           } catch (err) {
             // Terminal-fail the durable request on the FINAL pg-boss attempt so
             // durable re-claims and pg-boss retries never multiply. Content-free

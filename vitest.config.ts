@@ -42,7 +42,6 @@ export default defineConfig({
         // unit-coverage gate. Kept out of the unit threshold so it measures the
         // pure, deterministic logic honestly.
         "src/providers/imap-smtp/imap-client.ts",
-        "src/providers/imap-smtp/smtp-client.ts",
         "src/workers/provider-factory.ts",
         "src/db/pool.ts",
         "src/db/repositories.ts",

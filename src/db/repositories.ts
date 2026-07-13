@@ -174,6 +174,22 @@ export class FolderRepository implements FolderStore {
     return row === undefined ? null : this.map(row);
   }
 
+  /** SELECT-only role lookup (e.g. the discovered, possibly localized Sent). */
+  public async findByRole(
+    mailboxId: string,
+    role: MailboxFolderRow["role"],
+  ): Promise<MailboxFolderRow | null> {
+    const r = await this.db.query(
+      `select * from public.mailbox_folders
+        where mailbox_id = $1 and role = $2
+        order by name asc
+        limit 1`,
+      [mailboxId, role],
+    );
+    const row = r.rows[0];
+    return row === undefined ? null : this.map(row);
+  }
+
   /** Advance the sync cursor. Persisted ONLY after messages are durably stored. */
   public async updateCursor(input: {
     id: string;

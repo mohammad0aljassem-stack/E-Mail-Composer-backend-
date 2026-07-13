@@ -61,3 +61,53 @@ describe("env config (fail-closed)", () => {
     expect(cfg.credentialKeyring.size).toBe(0);
   });
 });
+
+describe("strict boolean env parsing (C5)", () => {
+  const base = { DATABASE_URL: "postgres://localhost/db" };
+
+  it.each(["yes", "on", "TRUE ", "enabled", "tru"])(
+    "rejects TRANSPORT_GLOBAL_KILL_SWITCH=%j (never silently DISENGAGED)",
+    (value) => {
+      expect(() =>
+        loadConfig({ ...base, TRANSPORT_GLOBAL_KILL_SWITCH: value }),
+      ).toThrow(TransportError);
+    },
+  );
+
+  it.each(["yes", "on", "TRUE ", "garbage"])(
+    "rejects MAIL_TRANSPORT_V1_ENABLED=%j",
+    (value) => {
+      expect(() =>
+        loadConfig({ ...base, MAIL_TRANSPORT_V1_ENABLED: value }),
+      ).toThrow(TransportError);
+    },
+  );
+
+  it("accepts exactly 1/true/0/false", () => {
+    expect(
+      loadConfig({ ...base, TRANSPORT_GLOBAL_KILL_SWITCH: "1" })
+        .globalKillSwitch,
+    ).toBe(true);
+    expect(
+      loadConfig({ ...base, TRANSPORT_GLOBAL_KILL_SWITCH: "true" })
+        .globalKillSwitch,
+    ).toBe(true);
+    expect(
+      loadConfig({ ...base, TRANSPORT_GLOBAL_KILL_SWITCH: "0" })
+        .globalKillSwitch,
+    ).toBe(false);
+    expect(
+      loadConfig({ ...base, TRANSPORT_GLOBAL_KILL_SWITCH: "false" })
+        .globalKillSwitch,
+    ).toBe(false);
+  });
+
+  it("still applies defaults for undefined and empty string", () => {
+    expect(loadConfig(base).globalKillSwitch).toBe(false);
+    expect(loadConfig(base).transportEnabled).toBe(false);
+    expect(
+      loadConfig({ ...base, TRANSPORT_GLOBAL_KILL_SWITCH: "" })
+        .globalKillSwitch,
+    ).toBe(false);
+  });
+});

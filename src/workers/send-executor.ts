@@ -16,6 +16,7 @@ import { buildOutboundMime } from "../mime/outbound-builder.js";
 import type { Logger } from "../observability/logger.js";
 import type {
   AuditWriter,
+  FolderRoleReader,
   MailboxReader,
   SendAttemptStore,
   SendIntentReader,
@@ -24,6 +25,7 @@ import type {
 import type {
   MailProvider,
   OutboundMessage,
+  SendResult,
 } from "../providers/mail-provider.js";
 import type {
   ProviderFactory,
@@ -64,6 +66,7 @@ export interface SendExecutorDeps {
   intents: SendIntentReader;
   attempts: SendAttemptStore;
   mailboxes: MailboxReader;
+  folders: FolderRoleReader;
   claims: WorkerClaimStore;
   audit: AuditWriter;
   providerFactory: ProviderFactory;
@@ -305,10 +308,9 @@ export class SendExecutor {
       messageId: intent.messageId,
     });
 
-    let sendResponse: string;
+    let sendResult: SendResult;
     try {
-      const result = await provider.sendMessage(outbound); // OUTSIDE any txn
-      sendResponse = result.response;
+      sendResult = await provider.sendMessage(outbound); // OUTSIDE any txn
     } catch (err) {
       if (err instanceof SmtpPreDataError) {
         await this.deps.attempts.compareAndSet({
@@ -351,12 +353,41 @@ export class SendExecutor {
       return "needs_human_review";
     }
 
+    // Partial RCPT rejection: the SMTP server accepted DATA for SOME recipients
+    // and rejected others. The message WAS transmitted (to the accepted set),
+    // so this must never look like a clean completion and must NEVER be
+    // retried (a retry would double-deliver to the accepted recipients).
+    // Evidence is counts only — never a recipient address. (A fully rejected
+    // envelope throws EENVELOPE before DATA and takes the pre-DATA path; a
+    // resolved result with rejections is therefore handled conservatively
+    // whenever rejected_count > 0.)
+    const acceptedCount = sendResult.accepted.length;
+    const rejectedCount = sendResult.rejected.length;
+    if (rejectedCount > 0) {
+      await this.toNeedsHumanReview(
+        intent,
+        attemptId,
+        inProgress.version,
+        "smtp_in_progress",
+        {
+          accepted_count: acceptedCount,
+          rejected_count: rejectedCount,
+          reason: "rcpt_partial_rejection",
+        },
+      );
+      log.warn("smtp_partial_rejection", {
+        accepted_count: acceptedCount,
+        rejected_count: rejectedCount,
+      });
+      return "needs_human_review";
+    }
+
     const accepted = await this.deps.attempts.compareAndSet({
       id: attemptId,
       expectedVersion: inProgress.version,
       expectedState: "smtp_in_progress",
       toState: "smtp_accepted",
-      fields: { smtpResponse: sendResponse.slice(0, 4000) },
+      fields: { smtpResponse: sendResult.response.slice(0, 4000) },
     });
     if (accepted === null) return "claim_lost";
 
@@ -389,8 +420,12 @@ export class SendExecutor {
     outbound: OutboundMessage,
     log: Logger,
   ): Promise<SendOutcome> {
-    const sentFolder = this.deps.config.sentFolder;
     try {
+      // Resolve the DISCOVERED sent-role folder for this mailbox (IONOS
+      // localizes it, e.g. "Gesendete Objekte"); fall back to the configured
+      // default when discovery has no sent-role row. Used by both the direct
+      // completion path and reconcileSentCopy (which delegates here).
+      const sentFolder = await this.resolveSentFolder(intent.mailboxId);
       const existing = await provider.findByMessageId(
         sentFolder,
         intent.messageId,
@@ -462,6 +497,15 @@ export class SendExecutor {
   }
 
   // ---- verification helpers ------------------------------------------------
+
+  /**
+   * The Sent folder as DISCOVERED for this mailbox (`mailbox_folders` role =
+   * 'sent'), falling back to the configured default name. Read-only lookup.
+   */
+  private async resolveSentFolder(mailboxId: string): Promise<string> {
+    const row = await this.deps.folders.findByRole(mailboxId, "sent");
+    return row?.name ?? this.deps.config.sentFolder;
+  }
 
   private async mailboxSendable(mailboxId: string): Promise<boolean> {
     if (this.deps.config.globalKillSwitch) return false;

@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { JsonLogger } from "../../src/observability/logger.js";
-import { SyncExecutor } from "../../src/workers/sync-executor.js";
+import {
+  SyncExecutor,
+  enqueueSyncFollowUp,
+  type SyncResult,
+} from "../../src/workers/sync-executor.js";
 import { TransportError } from "../../src/domain/errors.js";
 import {
   FakeAuditRepo,
@@ -18,7 +22,11 @@ import {
   WORKSPACE_ID,
 } from "../helpers/send-fixtures.js";
 
-function makeHarness(options?: { batchSize?: number; enabled?: boolean }) {
+function makeHarness(options?: {
+  batchSize?: number;
+  enabled?: boolean;
+  globalKillSwitch?: boolean;
+}) {
   const mailboxes = new FakeMailboxRepo();
   mailboxes.rows.set(
     MAILBOX_ID,
@@ -40,9 +48,12 @@ function makeHarness(options?: { batchSize?: number; enabled?: boolean }) {
     providerFactory: factory,
     clock: new TestClock(),
     logger,
-    config: { batchSize: options?.batchSize ?? 200 },
+    config: {
+      batchSize: options?.batchSize ?? 200,
+      globalKillSwitch: options?.globalKillSwitch ?? false,
+    },
   });
-  return { exec, folders, messages, audit, server, mailboxes };
+  return { exec, folders, messages, audit, server, mailboxes, factory };
 }
 
 const initialJob = {
@@ -149,6 +160,34 @@ describe("SyncExecutor", () => {
     );
   });
 
+  // C6: the global kill switch skips content-free with ZERO IMAP connects,
+  // even for an already-enqueued job.
+  it("skips under the global kill switch without any IMAP connect", async () => {
+    const h = makeHarness({ globalKillSwitch: true });
+    h.server.seedMessage("INBOX", { messageId: "<m1@x>" });
+    const res = await h.exec.execute(initialJob);
+    expect(res).toEqual({
+      persisted: 0,
+      uidValidityChanged: false,
+      needsFollowUp: false,
+    });
+    expect(h.factory.createdCount).toBe(0); // no provider, no IMAP connect
+    expect(h.messages.rows.size).toBe(0);
+  });
+
+  // C9: a References header carried by the provider is persisted (threading).
+  it("persists the References header from a fetched message", async () => {
+    const h = makeHarness();
+    h.server.seedMessage("INBOX", {
+      messageId: "<reply-1@x>",
+      references: "<root@x> <mid@x>",
+    });
+    await h.exec.execute(initialJob);
+    const stored = [...h.messages.rows.values()];
+    expect(stored).toHaveLength(1);
+    expect(stored[0]?.referencesHeader).toBe("<root@x> <mid@x>");
+  });
+
   // Test 10 + 11: a full batch signals a follow-up; cursor tracks max uid.
   it("signals a follow-up when a full batch is returned", async () => {
     const h = makeHarness({ batchSize: 2 });
@@ -167,6 +206,60 @@ describe("SyncExecutor", () => {
     expect(
       (await h.folders.getByMailboxAndName(MAILBOX_ID, "INBOX"))?.lastSeenUid,
     ).toBe(3n);
+  });
+});
+
+// C4: the sync_mailbox handler acts on needsFollowUp so a multi-batch backlog
+// drains instead of stalling. Tested via the handler helper the worker calls.
+describe("enqueueSyncFollowUp (sync_mailbox handler)", () => {
+  const logger = new JsonLogger({ level: "error", sink: { write: () => {} } });
+  const job = {
+    workspaceId: WORKSPACE_ID,
+    mailboxId: MAILBOX_ID,
+    folder: "INBOX",
+    mode: "initial" as const,
+  };
+  const result = (needsFollowUp: boolean): SyncResult => ({
+    persisted: 0,
+    uidValidityChanged: false,
+    needsFollowUp,
+  });
+
+  it("enqueues exactly one incremental follow-up when needsFollowUp is true", async () => {
+    const enqueued: unknown[] = [];
+    const followedUp = await enqueueSyncFollowUp({
+      result: result(true),
+      job,
+      enqueueSync: (j) => {
+        enqueued.push(j);
+        return Promise.resolve("job-1");
+      },
+      logger,
+    });
+    expect(followedUp).toBe(true);
+    expect(enqueued).toEqual([
+      {
+        workspaceId: WORKSPACE_ID,
+        mailboxId: MAILBOX_ID,
+        folder: "INBOX",
+        mode: "incremental",
+      },
+    ]);
+  });
+
+  it("enqueues nothing when needsFollowUp is false", async () => {
+    const enqueued: unknown[] = [];
+    const followedUp = await enqueueSyncFollowUp({
+      result: result(false),
+      job,
+      enqueueSync: (j) => {
+        enqueued.push(j);
+        return Promise.resolve("job-1");
+      },
+      logger,
+    });
+    expect(followedUp).toBe(false);
+    expect(enqueued).toHaveLength(0);
   });
 });
 

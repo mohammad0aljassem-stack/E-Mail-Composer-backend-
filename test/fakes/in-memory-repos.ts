@@ -89,6 +89,16 @@ export class FakeFolderRepo implements FolderStore {
     return Promise.resolve(this.rows.get(`${mailboxId}:${name}`) ?? null);
   }
 
+  public findByRole(
+    mailboxId: string,
+    role: MailboxFolderRow["role"],
+  ): Promise<MailboxFolderRow | null> {
+    const match = [...this.rows.values()]
+      .filter((r) => r.mailboxId === mailboxId && r.role === role)
+      .sort((a, b) => a.name.localeCompare(b.name))[0];
+    return Promise.resolve(match ?? null);
+  }
+
   public updateCursor(input: {
     id: string;
     uidvalidity: bigint;

@@ -3,6 +3,7 @@ import type {
   MailboxRow,
   SendAttemptRow,
   SendIntentRow,
+  SendRecipients,
 } from "../../src/domain/models.js";
 import type { SendState } from "../../src/domain/send-state.js";
 import { buildOutboundMime } from "../../src/mime/outbound-builder.js";
@@ -55,6 +56,7 @@ export async function buildFixture(options?: {
   html?: string | null;
   text?: string | null;
   revision?: bigint;
+  recipients?: SendRecipients;
 }): Promise<BuiltFixture> {
   const html = options?.html ?? "<p>Hello</p>";
   const text = options?.text ?? "Hello";
@@ -62,7 +64,7 @@ export async function buildFixture(options?: {
   const message: OutboundMessage = {
     messageId: MESSAGE_ID,
     sender: "sender@mail.example.com",
-    recipients: { to: ["recipient@example.com"] },
+    recipients: options?.recipients ?? { to: ["recipient@example.com"] },
     subject: "Test subject",
     html,
     text,
