@@ -239,13 +239,28 @@ export class SendExecutor {
         return "failed_before_delivery";
       }
 
+      // (4b) SENDER AUTHORITY (fail-closed, BEFORE any SMTP byte). The
+      // authoritative sender is the immutable persisted send_intents.sender. We
+      // load the mailbox for the SAME mailbox/workspace and cross-check that the
+      // intent's sender still equals the mailbox address (trim + lowercase). On
+      // ANY mismatch we submit ZERO SMTP bytes, record only a content-free
+      // failure code, do NOT auto-retry, do NOT silently correct the sender, and
+      // do NOT recompute the confirmation proof with a different sender.
+      const mailbox = await this.requireMailbox(intent.mailboxId);
+      const authority = this.checkSenderAuthority(intent, mailbox);
+      if (!authority.ok) {
+        await this.toFailedBeforeDelivery(intent, cur.id, cur.version, {
+          reason: authority.reason,
+        });
+        log.warn("send_sender_authority_failed", { reason: authority.reason });
+        return "failed_before_delivery";
+      }
+
       const outbound: OutboundMessage = {
         ...payload.message,
         messageId: intent.messageId,
       };
-      const provider = await this.deps.providerFactory.create(
-        await this.requireMailbox(intent.mailboxId),
-      );
+      const provider = await this.deps.providerFactory.create(mailbox);
       try {
         return await this.deliver(
           intent,
@@ -493,6 +508,28 @@ export class SendExecutor {
       return { kind: "failed", reason: "attachment_manifest_mismatch" };
     }
     return { kind: "ok" };
+  }
+
+  /**
+   * Authoritative-sender cross-check. The confirmation proof is already bound to
+   * `intent.sender`; here we additionally prove — at execution time, from the
+   * live mailbox row — that the immutable sender still equals the mailbox
+   * address (and belongs to the same workspace). Normalization is the same
+   * trim + lowercase the SQL RPC applied, so a legitimately-authored intent
+   * always passes and a tampered/stale one fails closed. Content-free reasons.
+   */
+  private checkSenderAuthority(
+    intent: SendIntentRow,
+    mailbox: MailboxRow,
+  ): { ok: true } | { ok: false; reason: string } {
+    if (mailbox.workspaceId !== intent.workspaceId) {
+      return { ok: false, reason: "sender_authority_workspace_mismatch" };
+    }
+    const norm = (s: string): string => s.trim().toLowerCase();
+    if (norm(intent.sender) !== norm(mailbox.emailAddress)) {
+      return { ok: false, reason: "sender_authority_mismatch" };
+    }
+    return { ok: true };
   }
 
   private async requireMailbox(mailboxId: string): Promise<MailboxRow> {
