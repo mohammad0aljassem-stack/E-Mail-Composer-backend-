@@ -4,6 +4,9 @@
  * Fail-closed startup: when MAIL_TRANSPORT_V1_ENABLED is false the worker
  * connects only enough to report health = transport-disabled; it registers NO
  * work handlers, opens NO IMAP/SMTP connection, and decrypts NO credential.
+ * With the master flag on, each handler additionally registers ONLY when its
+ * own sub-capability flag (MAIL_SYNC_ENABLED / MAIL_MUTATIONS_ENABLED /
+ * MAIL_SEND_ENABLED / ...) is true — see ./registration-plan.ts.
  *
  * NOT a scheduler/runtime for CI — CI runs tests. This is the long-lived worker.
  */
@@ -33,6 +36,7 @@ import type {
   SendMessageJob,
   SyncMailboxJob,
 } from "../queues/queue-config.js";
+import { plannedRegistrations } from "./registration-plan.js";
 import { ImapSmtpProviderFactory } from "../workers/provider-factory.js";
 import { SendExecutor } from "../workers/send-executor.js";
 import { SyncExecutor, enqueueSyncFollowUp } from "../workers/sync-executor.js";
@@ -64,10 +68,17 @@ async function main(): Promise<void> {
     transportEnabled: config.transportEnabled,
     globalKillSwitch: config.globalKillSwitch,
   });
+  // Content-free capability matrix (booleans only): the effective per-worker
+  // capability flags — each already masked by the master flag in loadConfig.
   logger.info("startup_health", {
     status: health.status,
     transport_enabled: health.transportEnabled,
     db_reachable: health.dbReachable,
+    sync_enabled: config.syncEnabled,
+    idle_enabled: config.idleEnabled,
+    draft_mirror_enabled: config.draftMirrorEnabled,
+    mutations_enabled: config.mutationsEnabled,
+    send_enabled: config.sendEnabled,
   });
 
   const queues = new QueueManager({
@@ -80,9 +91,22 @@ async function main(): Promise<void> {
 
   let dispatchTimer: ReturnType<typeof setInterval> | null = null;
 
+  // Effective capability registration plan (C2): each handler registers ONLY
+  // when the master flag AND its own sub-capability flag are true.
+  const plan = plannedRegistrations(config);
+  const anyCapability =
+    plan.syncMailbox ||
+    plan.applyMutation ||
+    plan.sendMessage ||
+    plan.draftMirror;
+
   if (!config.transportEnabled) {
     // Fail-closed: no work handlers, no provider, no decryption.
     logger.warn("transport_disabled_idle");
+  } else if (!anyCapability) {
+    // Master flag on but every sub-capability off: fail-closed idle — no
+    // handler registers, no provider factory, no credential is decrypted.
+    logger.warn("transport_no_capability_enabled_idle");
   } else {
     const cipher = new AesGcmCredentialCipher({
       keyring: config.credentialKeyring,
@@ -96,167 +120,187 @@ async function main(): Promise<void> {
         smtpTimeoutMs: config.smtpTimeoutMs,
       },
     });
-
-    const syncExec = new SyncExecutor({
-      mailboxes: new MailboxRepository(db),
-      folders: new FolderRepository(db),
-      messages: new MessageRepository(db),
-      audit: new AuditRepository(db),
-      providerFactory,
-      clock,
-      logger,
-      config: {
-        batchSize: 200,
-        globalKillSwitch: config.globalKillSwitch,
-      },
-    });
     const workerClaims = new WorkerClaimRepository(db);
-    const sendExec = new SendExecutor({
-      intents: new SendIntentRepository(db),
-      attempts: new SendAttemptRepository(db),
-      mailboxes: new MailboxRepository(db),
-      folders: new FolderRepository(db),
-      claims: workerClaims,
-      audit: new AuditRepository(db),
-      providerFactory,
-      payloadResolver: {
-        // Phase 3A ships no draft->payload assembler in the worker; that is a
-        // Phase 3B controlled-mailbox step. Fail closed if invoked.
-        resolve: () => {
-          throw new Error("send payload resolver not configured");
+
+    if (plan.syncMailbox) {
+      const syncExec = new SyncExecutor({
+        mailboxes: new MailboxRepository(db),
+        folders: new FolderRepository(db),
+        messages: new MessageRepository(db),
+        audit: new AuditRepository(db),
+        providerFactory,
+        clock,
+        logger,
+        config: {
+          batchSize: 200,
+          globalKillSwitch: config.globalKillSwitch,
         },
-      },
-      clock,
-      logger,
-      config: {
-        workerId: config.workerId,
-        claimLeaseMs: config.claimLeaseMs,
-        globalKillSwitch: config.globalKillSwitch,
-        // Fallback ONLY: the executor resolves the discovered sent-role
-        // folder per mailbox (IONOS localizes it) and uses this default when
-        // discovery has no sent-role row.
-        sentFolder: "Sent",
-      },
-    });
-    const mutationExec = new MutationExecutor({
-      mailboxes: new MailboxRepository(db),
-      audit: new AuditRepository(db),
-      providerFactory,
-      logger,
-      config: { globalKillSwitch: config.globalKillSwitch },
-    });
-
-    // Durable transport.sync_requests consumer/dispatcher (B3/B4). The worker
-    // holds only SELECT+UPDATE on the table; the DEFINER RPC inserts. Runs only
-    // because the transport flag is on (this whole branch is flag-gated).
-    const dispatcher = new SyncRequestDispatcher({
-      syncRequests: new SyncRequestRepository(db),
-      mailboxes: new MailboxRepository(db),
-      sendClaims: workerClaims,
-      enqueueSync: (job) => queues.enqueueSyncForRequest(job),
-      clock,
-      logger,
-      config: {
-        transportEnabled: config.transportEnabled,
-        globalKillSwitch: config.globalKillSwitch,
-        batchSize: config.syncClaimBatchSize,
-        leaseMs: config.syncClaimLeaseMs,
-        maxAttempts: config.syncMaxAttempts,
-      },
-    });
-    const syncRetryLimit =
-      QUEUE_DEFINITIONS[QUEUE_NAMES.syncMailbox].retryLimit ?? 0;
-
-    await queues.instance.work(
-      QUEUE_NAMES.syncMailbox,
-      { includeMetadata: true },
-      async (jobs: JobWithMetadata<SyncMailboxJob>[]) => {
-        for (const job of jobs) {
-          const requestId = job.data.syncRequestId;
-          try {
-            const result = await syncExec.execute(job.data);
-            // Mark the durable request completed ONLY after the sync completed.
-            if (requestId !== undefined) {
-              await dispatcher.markCompleted(requestId);
-            }
-            // Multi-batch backlog: enqueue ONE incremental follow-up sync for
-            // the same mailbox+folder (deduped by the mailbox+folder
-            // singletonKey, workspace group preserved).
-            await enqueueSyncFollowUp({
-              result,
-              job: job.data,
-              enqueueSync: (followUp) => queues.enqueueSync(followUp),
-              logger,
-            });
-          } catch (err) {
-            // Terminal-fail the durable request on the FINAL pg-boss attempt so
-            // durable re-claims and pg-boss retries never multiply. Content-free
-            // code only. Re-throw so pg-boss records the job failure too.
-            if (requestId !== undefined && job.retryCount >= syncRetryLimit) {
-              await dispatcher
-                .markFailed(requestId, "sync_failed")
-                .catch(() => undefined);
-            }
-            throw err;
-          }
-        }
-      },
-    );
-    await queues.instance.work(
-      QUEUE_NAMES.sendMessage,
-      async (jobs: Job<SendMessageJob>[]) => {
-        for (const job of jobs) {
-          await sendExec.execute({
-            sendIntentId: job.data.sendIntentId,
-            sendAttemptId: job.data.sendAttemptId,
-            workspaceId: job.data.workspaceId,
-          });
-        }
-      },
-    );
-    await queues.instance.work(
-      QUEUE_NAMES.applyMutation,
-      async (jobs: Job<ApplyMutationJob>[]) => {
-        for (const job of jobs) {
-          const d = job.data;
-          const mutation =
-            d.mutation.kind === "move"
-              ? {
-                  kind: "move" as const,
-                  folder: d.folder,
-                  uid: BigInt(d.uid),
-                  toFolder: d.mutation.toFolder,
-                }
-              : {
-                  kind: d.mutation.kind,
-                  folder: d.folder,
-                  uid: BigInt(d.uid),
-                  flags: d.mutation.flags,
-                };
-          await mutationExec.execute({
-            workspaceId: d.workspaceId,
-            mailboxId: d.mailboxId,
-            mutation,
-          });
-        }
-      },
-    );
-    // draft_mirror worker intentionally not registered by default in 3A
-    // (queue exists; the DraftMirrorExecutor + its tests are complete).
-
-    // Poll-drive the durable sync-request dispatcher. This is NOT a scheduler:
-    // it only claims already-persisted requests and enqueues pg-boss jobs; it
-    // never creates work from SQL and never polls transport_audit.
-    dispatchTimer = setInterval(() => {
-      void dispatcher.dispatchOnce().catch((err: unknown) => {
-        logger.error("sync_dispatch_failed", {
-          error: err instanceof Error ? err.name : "unknown",
-        });
       });
-    }, config.syncDispatchIntervalMs);
-    dispatchTimer.unref?.();
 
-    logger.info("workers_registered");
+      // Durable transport.sync_requests consumer/dispatcher (B3/B4). The
+      // worker holds only SELECT+UPDATE on the table; the DEFINER RPC inserts.
+      // Runs only because master + sync capability are on (this whole branch
+      // is flag-gated).
+      const dispatcher = new SyncRequestDispatcher({
+        syncRequests: new SyncRequestRepository(db),
+        mailboxes: new MailboxRepository(db),
+        sendClaims: workerClaims,
+        enqueueSync: (job) => queues.enqueueSyncForRequest(job),
+        clock,
+        logger,
+        config: {
+          transportEnabled: config.transportEnabled,
+          globalKillSwitch: config.globalKillSwitch,
+          batchSize: config.syncClaimBatchSize,
+          leaseMs: config.syncClaimLeaseMs,
+          maxAttempts: config.syncMaxAttempts,
+        },
+      });
+      const syncRetryLimit =
+        QUEUE_DEFINITIONS[QUEUE_NAMES.syncMailbox].retryLimit ?? 0;
+
+      await queues.instance.work(
+        QUEUE_NAMES.syncMailbox,
+        { includeMetadata: true },
+        async (jobs: JobWithMetadata<SyncMailboxJob>[]) => {
+          for (const job of jobs) {
+            const requestId = job.data.syncRequestId;
+            try {
+              const result = await syncExec.execute(job.data);
+              // Mark the durable request completed ONLY after the sync completed.
+              if (requestId !== undefined) {
+                await dispatcher.markCompleted(requestId);
+              }
+              // Multi-batch backlog: enqueue ONE incremental follow-up sync for
+              // the same mailbox+folder (deduped by the mailbox+folder
+              // singletonKey, workspace group preserved).
+              await enqueueSyncFollowUp({
+                result,
+                job: job.data,
+                enqueueSync: (followUp) => queues.enqueueSync(followUp),
+                logger,
+              });
+            } catch (err) {
+              // Terminal-fail the durable request on the FINAL pg-boss attempt so
+              // durable re-claims and pg-boss retries never multiply. Content-free
+              // code only. Re-throw so pg-boss records the job failure too.
+              if (requestId !== undefined && job.retryCount >= syncRetryLimit) {
+                await dispatcher
+                  .markFailed(requestId, "sync_failed")
+                  .catch(() => undefined);
+              }
+              throw err;
+            }
+          }
+        },
+      );
+
+      // Poll-drive the durable sync-request dispatcher. This is NOT a
+      // scheduler: it only claims already-persisted requests and enqueues
+      // pg-boss jobs; it never creates work from SQL and never polls
+      // transport_audit.
+      dispatchTimer = setInterval(() => {
+        void dispatcher.dispatchOnce().catch((err: unknown) => {
+          logger.error("sync_dispatch_failed", {
+            error: err instanceof Error ? err.name : "unknown",
+          });
+        });
+      }, config.syncDispatchIntervalMs);
+      dispatchTimer.unref?.();
+    }
+
+    if (plan.sendMessage) {
+      const sendExec = new SendExecutor({
+        intents: new SendIntentRepository(db),
+        attempts: new SendAttemptRepository(db),
+        mailboxes: new MailboxRepository(db),
+        folders: new FolderRepository(db),
+        claims: workerClaims,
+        audit: new AuditRepository(db),
+        providerFactory,
+        payloadResolver: {
+          // Phase 3A ships no draft->payload assembler in the worker; that is a
+          // Phase 3B controlled-mailbox step. Fail closed if invoked.
+          resolve: () => {
+            throw new Error("send payload resolver not configured");
+          },
+        },
+        clock,
+        logger,
+        config: {
+          workerId: config.workerId,
+          claimLeaseMs: config.claimLeaseMs,
+          globalKillSwitch: config.globalKillSwitch,
+          // Fallback ONLY: the executor resolves the discovered sent-role
+          // folder per mailbox (IONOS localizes it) and uses this default when
+          // discovery has no sent-role row.
+          sentFolder: "Sent",
+        },
+      });
+      await queues.instance.work(
+        QUEUE_NAMES.sendMessage,
+        async (jobs: Job<SendMessageJob>[]) => {
+          for (const job of jobs) {
+            await sendExec.execute({
+              sendIntentId: job.data.sendIntentId,
+              sendAttemptId: job.data.sendAttemptId,
+              workspaceId: job.data.workspaceId,
+            });
+          }
+        },
+      );
+    }
+
+    if (plan.applyMutation) {
+      const mutationExec = new MutationExecutor({
+        mailboxes: new MailboxRepository(db),
+        audit: new AuditRepository(db),
+        providerFactory,
+        logger,
+        config: { globalKillSwitch: config.globalKillSwitch },
+      });
+      await queues.instance.work(
+        QUEUE_NAMES.applyMutation,
+        async (jobs: Job<ApplyMutationJob>[]) => {
+          for (const job of jobs) {
+            const d = job.data;
+            const mutation =
+              d.mutation.kind === "move"
+                ? {
+                    kind: "move" as const,
+                    folder: d.folder,
+                    uid: BigInt(d.uid),
+                    toFolder: d.mutation.toFolder,
+                  }
+                : {
+                    kind: d.mutation.kind,
+                    folder: d.folder,
+                    uid: BigInt(d.uid),
+                    flags: d.mutation.flags,
+                  };
+            await mutationExec.execute({
+              workspaceId: d.workspaceId,
+              mailboxId: d.mailboxId,
+              mutation,
+            });
+          }
+        },
+      );
+    }
+
+    // draft_mirror worker intentionally not registered in this phase (queue
+    // exists; the DraftMirrorExecutor + its tests are complete; the
+    // MAIL_DRAFT_MIRROR_ENABLED flag exists and defaults false — slice 3
+    // registers the handler behind it).
+
+    // Content-free capability matrix (booleans only).
+    logger.info("workers_registered", {
+      sync_mailbox: plan.syncMailbox,
+      sync_dispatcher: plan.syncDispatcher,
+      send_message: plan.sendMessage,
+      apply_mutation: plan.applyMutation,
+      draft_mirror: plan.draftMirror,
+    });
   }
 
   // Graceful shutdown: stop taking new work, flush heartbeat, close pools.

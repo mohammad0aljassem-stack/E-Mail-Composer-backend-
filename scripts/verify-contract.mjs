@@ -38,6 +38,19 @@
 //   14 NO audit-table polling of public.transport_audit as a work queue
 //   15 durable sync-request support present: SyncRequestRepository.claimBatch
 //      exists and its SQL uses FOR UPDATE SKIP LOCKED
+//
+// Phase 3B additions (additive; checks 1–15 unchanged):
+//   12b EVERY MAIL_*_ENABLED capability flag in src/config/env.ts (master +
+//       the sync/idle/draft-mirror/mutations/send sub-flags) is parsed by the
+//       strict bool() parser with a default of false. The sub-capability
+//       flags are deliberately NOT in the UI manifest: the schema contract
+//       has no dependency on worker sub-capabilities, so the backend env
+//       parser is the single source of truth for these runtime controls and
+//       the fail-closed default is enforced HERE.
+//   16  read-only executor modules (sync / mutation / draft-mirror /
+//       sync-request dispatcher) neither import nor construct the SMTP
+//       client (NodemailerSmtpClient) — a read-only sync can never carry
+//       SMTP capability.
 // ============================================================================
 
 import { execFileSync } from "node:child_process";
@@ -311,6 +324,53 @@ if (manifest !== null) {
   }
 }
 
+// --- 12b. every MAIL_*_ENABLED capability flag defaults to false ------------
+// Sub-capability flags are deliberately NOT part of the UI manifest (the
+// schema contract has no dependency on worker sub-capabilities); the backend
+// env parser is the single source of truth for these runtime controls, so the
+// fail-closed default is enforced here.
+{
+  const src = readText("src/config/env.ts");
+  const EXPECTED_FLAGS = [
+    "MAIL_TRANSPORT_V1_ENABLED",
+    "MAIL_SYNC_ENABLED",
+    "MAIL_IDLE_ENABLED",
+    "MAIL_DRAFT_MIRROR_ENABLED",
+    "MAIL_MUTATIONS_ENABLED",
+    "MAIL_SEND_ENABLED",
+  ];
+  // Every strict-parser call site: bool(env.MAIL_*_ENABLED, <default>, ...).
+  const seen = new Map();
+  const boolCall = /bool\(\s*env\.(MAIL_[A-Z0-9_]*_ENABLED)\s*,\s*([^,)\s]+)/g;
+  let m;
+  while ((m = boolCall.exec(src)) !== null) {
+    seen.set(m[1], m[2]);
+  }
+  for (const flag of EXPECTED_FLAGS) {
+    if (!seen.has(flag)) {
+      fail(
+        `[12b] capability flag ${flag} is missing from src/config/env.ts (or not parsed via the strict bool() parser).`,
+      );
+    }
+  }
+  for (const [flag, def] of seen) {
+    if (def !== "false") {
+      fail(
+        `[12b] ${flag} default must be the literal false (fail-closed); found "${def}".`,
+      );
+    }
+  }
+  // Any MAIL_*_ENABLED env read that bypasses the strict parser is a failure.
+  const anyRead = /env\.(MAIL_[A-Z0-9_]*_ENABLED)\b/g;
+  while ((m = anyRead.exec(src)) !== null) {
+    if (!seen.has(m[1])) {
+      fail(
+        `[12b] ${m[1]} is read from env without the strict bool() parser (unparseable default).`,
+      );
+    }
+  }
+}
+
 // --- 13. no test-only object GRANT to transport_worker (sql/ts/scripts) ----
 for (const hit of scanWorkerObjectGrants()) {
   fail(`[13] test-only object GRANT to ${WORKER_ROLE} found: ${hit}.`);
@@ -331,6 +391,34 @@ for (const hit of scanAuditPolling()) {
     fail(
       "[15] the durable sync-request claim SQL must use FOR UPDATE SKIP LOCKED.",
     );
+  }
+}
+
+// --- 16. read-only executor modules never import/construct the SMTP client -
+{
+  const READ_ONLY_MODULES = [
+    "src/workers/sync-executor.ts",
+    "src/workers/mutation-executor.ts",
+    "src/workers/draft-mirror-executor.ts",
+    "src/workers/sync-request-dispatcher.ts",
+    // No IDLE module exists yet; when one lands it must be added here.
+  ];
+  const banned = /NodemailerSmtpClient|smtp-client|createSubmission/;
+  for (const rel of READ_ONLY_MODULES) {
+    let text;
+    try {
+      text = readText(rel);
+    } catch {
+      fail(`[16] expected read-only executor module missing: ${rel}.`);
+      continue;
+    }
+    for (const line of nonCommentLines(text)) {
+      if (banned.test(line)) {
+        fail(
+          `[16] SMTP-capability reference in read-only module ${rel}: ${line.trim().slice(0, 120)}.`,
+        );
+      }
+    }
   }
 }
 
@@ -481,8 +569,9 @@ function report() {
       `  manifest: ${lock.manifestPath} (sha256 ${lock.manifestSha256})\n` +
       `  versions: manifestSchema=${lock.supportedManifestSchemaVersion}, ` +
       `transportContract=${lock.supportedTransportContractVersion}\n` +
-      "  checks 1–15 passed (SHA, manifest hash, versions, migration checksums, " +
-      "privilege/queue/flag boundaries, static regression scans).",
+      "  checks 1–16 (incl. 12b) passed (SHA, manifest hash, versions, migration " +
+      "checksums, privilege/queue/flag boundaries, capability-flag defaults, " +
+      "static regression scans).",
   );
   process.exit(0);
 }

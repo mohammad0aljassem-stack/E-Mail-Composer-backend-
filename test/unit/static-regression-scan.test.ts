@@ -177,6 +177,62 @@ describe("B7 — no direct SMTP submission outside the provider adapter", () => 
   });
 });
 
+describe("C1 — SMTP capability is confined to the submission factory path", () => {
+  // The ONLY sanctioned SMTP client construction sites: the adapter itself and
+  // the capability-scoped provider factory (createSubmission).
+  const SMTP_CONSTRUCTION_ALLOWED = new Set<string>([
+    "src/providers/imap-smtp/smtp-client.ts",
+    "src/workers/provider-factory.ts",
+  ]);
+  // Files that must stay free of ANY SMTP-client coupling: the read-only /
+  // mailbox-mutating executors and the durable sync-request dispatcher.
+  const READ_ONLY_MODULES = [
+    "src/workers/sync-executor.ts",
+    "src/workers/mutation-executor.ts",
+    "src/workers/draft-mirror-executor.ts",
+    "src/workers/sync-request-dispatcher.ts",
+  ];
+
+  it("SMTP client construction happens only in the allowlisted files", () => {
+    const construction =
+      /new\s+NodemailerSmtpClient\b|nodemailer\.createTransport\s*\(/;
+    for (const rel of walk("src", [".ts"])) {
+      if (SMTP_CONSTRUCTION_ALLOWED.has(rel)) continue;
+      const code = codeLines(read(rel)).join("\n");
+      expect(
+        construction.test(code),
+        `SMTP client construction outside the factory in ${rel}`,
+      ).toBe(false);
+    }
+  });
+
+  it("no combined verifyConnection() call site remains anywhere", () => {
+    // The combined IMAP+SMTP verify was removed with the capability split; a
+    // reappearance would mean read paths verify SMTP again. The pattern is
+    // assembled at runtime so this scan file never matches itself.
+    const combined = new RegExp("verifyConnection" + "\\s*\\(");
+    for (const rel of [...walk("src", [".ts"]), ...walk("test", [".ts"])]) {
+      if (rel === "test/unit/static-regression-scan.test.ts") continue;
+      expect(
+        combined.test(read(rel)),
+        `combined verifyConnection call/definition in ${rel}`,
+      ).toBe(false);
+    }
+  });
+
+  it("read-only executor modules never touch the SMTP client module", () => {
+    const banned = /NodemailerSmtpClient|smtp-client|createSubmission/;
+    for (const rel of READ_ONLY_MODULES) {
+      for (const line of codeLines(read(rel))) {
+        expect(
+          banned.test(line),
+          `SMTP-capability reference in read-only module ${rel}: ${line.trim()}`,
+        ).toBe(false);
+      }
+    }
+  });
+});
+
 describe("B7 — send_message acquires no retry behavior", () => {
   it("the send_message queue block keeps retryLimit 0 / retryBackoff false", () => {
     const src = read("src/queues/queue-config.ts");

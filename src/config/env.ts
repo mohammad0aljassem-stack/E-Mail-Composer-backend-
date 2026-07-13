@@ -13,6 +13,19 @@ import { TransportError } from "../domain/errors.js";
 export interface TransportConfig {
   /** Master feature flag. Defaults false → fully fail-closed. */
   readonly transportEnabled: boolean;
+  /**
+   * Sub-capability flags (C2). Every one defaults false and each stored value
+   * is the EFFECTIVE value: a sub-flag is true only when its env var parsed
+   * true AND the master transportEnabled flag is true. A sub-flag set true
+   * with the master off simply fails closed to false (no startup error; the
+   * worker startup log surfaces the effective matrix). These are backend
+   * runtime controls — deliberately NOT part of the UI schema manifest.
+   */
+  readonly syncEnabled: boolean;
+  readonly idleEnabled: boolean;
+  readonly draftMirrorEnabled: boolean;
+  readonly mutationsEnabled: boolean;
+  readonly sendEnabled: boolean;
   /** Least-privilege worker DB connection string. */
   readonly databaseUrl: string;
   /** pg-boss schema (isolates the queue tables). */
@@ -150,6 +163,27 @@ export function loadConfig(
     "MAIL_TRANSPORT_V1_ENABLED",
   );
 
+  // Sub-capability flags (C2): every token is parsed STRICTLY even when the
+  // master flag is off (an invalid token always fails startup), THEN masked by
+  // the master flag — a sub-capability is effective only when the master is
+  // true. sub=true + master=false fails closed to false without throwing.
+  const effective = (raw: boolean): boolean => transportEnabled && raw;
+  const syncEnabled = effective(
+    bool(env.MAIL_SYNC_ENABLED, false, "MAIL_SYNC_ENABLED"),
+  );
+  const idleEnabled = effective(
+    bool(env.MAIL_IDLE_ENABLED, false, "MAIL_IDLE_ENABLED"),
+  );
+  const draftMirrorEnabled = effective(
+    bool(env.MAIL_DRAFT_MIRROR_ENABLED, false, "MAIL_DRAFT_MIRROR_ENABLED"),
+  );
+  const mutationsEnabled = effective(
+    bool(env.MAIL_MUTATIONS_ENABLED, false, "MAIL_MUTATIONS_ENABLED"),
+  );
+  const sendEnabled = effective(
+    bool(env.MAIL_SEND_ENABLED, false, "MAIL_SEND_ENABLED"),
+  );
+
   const databaseUrl = env.DATABASE_URL ?? "";
   if (databaseUrl === "") {
     throw new TransportError("config_invalid", "DATABASE_URL is required");
@@ -181,6 +215,11 @@ export function loadConfig(
 
   return {
     transportEnabled,
+    syncEnabled,
+    idleEnabled,
+    draftMirrorEnabled,
+    mutationsEnabled,
+    sendEnabled,
     databaseUrl,
     pgBossSchema: env.PGBOSS_SCHEMA ?? "pgboss",
     credentialKeyring,
