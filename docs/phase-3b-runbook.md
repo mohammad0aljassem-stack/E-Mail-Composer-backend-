@@ -49,7 +49,14 @@ Authorization must name, exactly:
   applied.
 - Role creation (`transport_worker`) and the **exact grants** (including the
   `phase3_send_attempt_transition_ok` EXECUTE grant — see
-  [runbook.md](runbook.md)).
+  [runbook.md](runbook.md)). Note the **known follow-up grant**: the canonical
+  migrations grant the worker **no** `SELECT` on `public.draft_versions`, and
+  the send/mirror payload resolvers therefore fail **closed**
+  (`draft_version_unreadable` / `skipped_missing_payload`). Before Gate G (and
+  before `MAIL_DRAFT_MIRROR_ENABLED` can be effective) an **additive UI-owned
+  grant migration** — `GRANT SELECT ON public.draft_versions TO
+transport_worker` — must land through the canonical manifest workflow
+  (never an ad-hoc statement, never from this repo).
 - The **expected schema diff** (reviewed) and the **rollback method** for this
   database change.
 
@@ -93,6 +100,33 @@ Authorization must name, exactly:
   folder, metadata-only rows, correct cursor, idempotent re-run) and **abort
   criteria** (anything unexpected → engage the kill switch, stop, review).
 
+**Gate F is technically enforceable** by the worker's capability matrix. The
+exact environment for this gate:
+
+```
+MAIL_TRANSPORT_V1_ENABLED=true
+MAIL_SYNC_ENABLED=true
+MAIL_IDLE_ENABLED=false        # optional for the first manual exercise
+MAIL_SEND_ENABLED=false
+MAIL_DRAFT_MIRROR_ENABLED=false
+MAIL_MUTATIONS_ENABLED=false
+```
+
+With this matrix the worker registers **only** the `sync_mailbox` handler and
+the durable sync-request dispatcher (`src/entrypoints/registration-plan.ts`:
+each handler registers only when master AND its own sub-flag are true), it
+**constructs no SMTP client** (the capability-scoped factory's
+`createSubmission` is reachable only from the `send_message` handler, which is
+not registered; the static scans in
+`test/unit/static-regression-scan.test.ts` pin SMTP construction to the
+factory), and it **performs no IMAP append** (sync is fetch/metadata-only).
+Proof artifacts: the registration-matrix unit tests in
+`test/unit/registration-plan.test.ts` ("Gate F: master + sync only → exactly
+the sync handler + dispatcher") plus the construction-counter tests
+(`submissionsCreated === 0`) in the sync/mutation/mirror/idle suites.
+Enabling `MAIL_IDLE_ENABLED=true` later within Gate F adds only the IDLE
+coordinator (IMAP-only wake-ups + deduped fallback syncs — still read-only).
+
 ### Gate G — first send (ONE message)
 
 Authorization must name, exactly:
@@ -106,6 +140,21 @@ Authorization must name, exactly:
   received exactly one copy, and the **Sent folder** holds one copy with the
   same Message-ID.
 - **Single-recipient only** for this first send (see operational notes).
+
+Gate G **additionally requires**, on top of the Gate F matrix:
+
+- `MAIL_SEND_ENABLED=true` (worker restart required — env flags are read at
+  startup). This is the only flag that registers the `send_message` handler,
+  the sole code path able to construct an SMTP client.
+- The **pre-Gate-G grant prerequisite**: an additive **UI-owned** grant
+  migration — `GRANT SELECT ON public.draft_versions TO transport_worker` —
+  applied through the canonical manifest workflow (listed under Gate C's
+  exact grants). Without it the production send-payload resolver **fails
+  closed** with `draft_version_unreadable` under the real worker role: no
+  payload, no hash verification, no SMTP byte. The same grant is required
+  before `MAIL_DRAFT_MIRROR_ENABLED` can be effective (the mirror resolver
+  reads the same immutable `draft_versions` snapshots and skips closed
+  without it).
 
 ### Gate H — failure drill
 
@@ -185,28 +234,42 @@ Rollback never requires deleting audit evidence, and **must not** delete it.
    `MAIL_TRANSPORT_V1_ENABLED=false`. Flags are read at startup → a **worker
    restart is required**. With the flag off the worker registers no handlers,
    opens no mail connection, decrypts nothing.
-2. **Disable per-mailbox** (live, no restart): set
+2. **Disable a single sub-capability** (finer-grained rollback, same
+   restart-required semantics): each `MAIL_*_ENABLED` flag is independently
+   disable-able — `MAIL_SEND_ENABLED=false` deregisters only the send
+   handler (SMTP becomes unconstructible), `MAIL_SYNC_ENABLED=false` stops
+   sync + dispatcher **and** the IDLE coordinator (idle requires sync),
+   `MAIL_IDLE_ENABLED=false` stops only the coordinator, and
+   `MAIL_MUTATIONS_ENABLED` / `MAIL_DRAFT_MIRROR_ENABLED` drop their single
+   handler. Every sub-flag is masked by the master flag.
+3. **Disable per-mailbox** (live, no restart): set
    `public.mailboxes.enabled=false` and/or `kill_switch=true` for the test
-   mailbox. Every job re-checks these before touching the provider.
-3. **Stop the worker**: `SIGTERM` performs a graceful shutdown — stops the
-   dispatch timer, pg-boss graceful stop, a final heartbeat, then `db.end()`.
-   There are **no persistent IDLE sessions** to tear down: connections are
-   per-job and closed in `finally`.
-4. **Prevent new claims**: any of flag off / global kill switch / per-mailbox
-   kill switch / worker stop prevents new send claims and new sync dispatch.
-5. **Preserve DB evidence**: `transport_audit` is append-only and is **never
+   mailbox. Every job re-checks these before touching the provider, and every
+   IDLE loop re-checks them at each checkpoint — a killed/disabled mailbox's
+   IDLE session is closed promptly at the next checkpoint, without a restart.
+4. **Stop the worker**: `SIGTERM` performs a graceful shutdown — stops the
+   dispatch timer, calls the IDLE coordinator's `stop()` (which closes EVERY
+   active IMAP IDLE session and clears its timers), pg-boss graceful stop, a
+   final heartbeat, then `db.end()`. Per-job connections are additionally
+   closed in `finally`; the coordinator's sessions are the only long-lived
+   ones and `stop()` owns them.
+5. **Prevent new claims**: any of flag off / global kill switch / per-mailbox
+   kill switch / worker stop prevents new send claims, new sync dispatch, and
+   new IDLE sessions (the global kill switch also stops running IDLE loops at
+   their next checkpoint — live, no restart).
+6. **Preserve DB evidence**: `transport_audit` is append-only and is **never
    deleted** (the worker cannot delete it — it holds SELECT+INSERT only…
    INSERT only, in fact, for audit). Confirmed `send_intents` remain intact.
    Ambiguous attempts **stay in `needs_human_review`, untouched — never
    auto-resent**.
-6. **Credential revocation**: flip `revoked_at = now()` on the active
+7. **Credential revocation**: flip `revoked_at = now()` on the active
    `transport.mailbox_credentials` row (optionally rotate the key version via
    `CREDENTIAL_KEYRING`'s additive versions and re-provision). The worker then
    fails closed with `credential_missing`.
-7. **Worker DB access removal** happens only via an authorized
+8. **Worker DB access removal** happens only via an authorized
    migration/provisioning step (role/grant changes are Gate-C-class changes) —
    never an ad-hoc statement.
-8. **What rollback cannot do**: an application rollback **cannot roll back
+9. **What rollback cannot do**: an application rollback **cannot roll back
    delivered mail**. An SMTP-accepted message is irreversible — which is
    exactly WHY ambiguous outcomes stop for human review instead of retrying.
 
