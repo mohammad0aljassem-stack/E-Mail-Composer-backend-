@@ -17,6 +17,7 @@ import { PgDatabase } from "../db/pool.js";
 import {
   AuditRepository,
   CredentialRepository,
+  DraftMirrorRepository,
   DraftVersionRepository,
   FolderRepository,
   HeartbeatRepository,
@@ -34,11 +35,14 @@ import { QueueManager } from "../queues/queue-manager.js";
 import { QUEUE_DEFINITIONS, QUEUE_NAMES } from "../queues/queue-config.js";
 import type {
   ApplyMutationJob,
+  DraftMirrorJob,
   SendMessageJob,
   SyncMailboxJob,
 } from "../queues/queue-config.js";
 import { plannedRegistrations } from "./registration-plan.js";
 import { ImapSmtpProviderFactory } from "../workers/provider-factory.js";
+import { DraftMirrorExecutor } from "../workers/draft-mirror-executor.js";
+import { DraftVersionMirrorPayloadResolver } from "../workers/draft-mirror-payload-resolver.js";
 import { SendExecutor } from "../workers/send-executor.js";
 import { DraftVersionSendPayloadResolver } from "../workers/send-payload-resolver.js";
 import { SyncExecutor } from "../workers/sync-executor.js";
@@ -294,10 +298,41 @@ async function main(): Promise<void> {
       );
     }
 
-    // draft_mirror worker intentionally not registered in this phase (queue
-    // exists; the DraftMirrorExecutor + its tests are complete; the
-    // MAIL_DRAFT_MIRROR_ENABLED flag exists and defaults false — slice 3
-    // registers the handler behind it).
+    if (plan.draftMirror) {
+      // Phase 3B C6: draft mirroring, registered ONLY behind master +
+      // MAIL_DRAFT_MIRROR_ENABLED (both default false). The executor keeps
+      // its invariants (idempotent per draft+revision, stale-revision
+      // rejection, append-before-retire, UIDVALIDITY-namespaced UIDs) and is
+      // IMAP-only: it never creates a send intent and never constructs SMTP.
+      // The payload resolver reads the SAME immutable draft_versions
+      // snapshots + deterministic renderer as the send path and fails closed
+      // (skipped_missing_payload) when the exact revision is unavailable.
+      const mirrorExec = new DraftMirrorExecutor({
+        mailboxes: new MailboxRepository(db),
+        mirrors: new DraftMirrorRepository(db),
+        audit: new AuditRepository(db),
+        providerFactory,
+        payloadResolver: new DraftVersionMirrorPayloadResolver({
+          draftVersions: new DraftVersionRepository(db),
+          mailboxes: new MailboxRepository(db),
+        }),
+        logger,
+        config: { draftsFolder: "Drafts" },
+      });
+      await queues.instance.work(
+        QUEUE_NAMES.draftMirror,
+        async (jobs: Job<DraftMirrorJob>[]) => {
+          for (const job of jobs) {
+            await mirrorExec.execute({
+              workspaceId: job.data.workspaceId,
+              mailboxId: job.data.mailboxId,
+              draftId: job.data.draftId,
+              revision: BigInt(job.data.revision),
+            });
+          }
+        },
+      );
+    }
 
     // Content-free capability matrix (booleans only).
     logger.info("workers_registered", {

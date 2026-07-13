@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
+import type { DraftVersionRow } from "../../src/domain/models.js";
 import { JsonLogger } from "../../src/observability/logger.js";
 import {
   DraftMirrorExecutor,
   type DraftPayloadResolver,
 } from "../../src/workers/draft-mirror-executor.js";
+import { DraftVersionMirrorPayloadResolver } from "../../src/workers/draft-mirror-payload-resolver.js";
 import {
   FakeAuditRepo,
   FakeDraftMirrorRepo,
+  FakeDraftVersionRepo,
   FakeMailboxRepo,
 } from "../fakes/in-memory-repos.js";
 import { FakeImapServer } from "../fakes/fake-imap.js";
@@ -33,17 +36,18 @@ function makeHarness(availableRevisions: bigint[] = [1n, 2n, 3n]) {
   const audit = new FakeAuditRepo();
   const server = new FakeImapServer();
   server.addFolder({ name: "Drafts", role: "drafts", uidvalidity: 7n });
-  const factory = new FakeProviderFactory(server, new FakeSmtpClient());
+  const smtp = new FakeSmtpClient();
+  const factory = new FakeProviderFactory(server, smtp);
   const payloadResolver: DraftPayloadResolver = {
-    resolve: (_draftId, revision) =>
+    resolve: (j) =>
       Promise.resolve(
-        availableRevisions.includes(revision)
-          ? { revision, mime: mime(revision) }
+        availableRevisions.includes(j.revision)
+          ? { revision: j.revision, mime: mime(j.revision) }
           : null,
       ),
   };
   const logger = new JsonLogger({ level: "error", sink: { write: () => {} } });
-  const exec = new DraftMirrorExecutor({
+  const depsSurface = {
     mailboxes,
     mirrors,
     audit,
@@ -51,8 +55,9 @@ function makeHarness(availableRevisions: bigint[] = [1n, 2n, 3n]) {
     payloadResolver,
     logger,
     config: { draftsFolder: "Drafts" },
-  });
-  return { exec, mirrors, server, audit, factory };
+  };
+  const exec = new DraftMirrorExecutor(depsSurface);
+  return { exec, mirrors, server, audit, factory, smtp, depsSurface };
 }
 
 function job(revision: bigint) {
@@ -121,5 +126,136 @@ describe("DraftMirrorExecutor", () => {
     const outcome = await h.exec.execute(job(5n));
     expect(outcome).toBe("skipped_missing_payload");
     expect(h.server.folder("Drafts").messages.size).toBe(0);
+  });
+
+  // C6: the mirror path has NO way to create a send intent or enqueue a send —
+  // its deps surface carries no queue/enqueue/intent writer at all, and the
+  // provider counters prove no SMTP channel is ever constructed.
+  it("never constructs SMTP and has no send-enqueue dependency surface", async () => {
+    const h = makeHarness();
+    await h.exec.execute(job(1n));
+    expect(h.factory.submissionsCreated).toBe(0);
+    expect(h.smtp.submissions).toHaveLength(0);
+    const depKeys = Object.keys(h.depsSurface).sort();
+    expect(depKeys).toEqual([
+      "audit",
+      "config",
+      "logger",
+      "mailboxes",
+      "mirrors",
+      "payloadResolver",
+      "providerFactory",
+    ]);
+    expect(depKeys.join(",")).not.toMatch(/queue|enqueue|intent|send/i);
+  });
+});
+
+describe("DraftVersionMirrorPayloadResolver (C6, production resolver)", () => {
+  const SNAPSHOT_DOC = {
+    type: "doc",
+    content: [
+      {
+        type: "paragraph",
+        content: [{ type: "text", text: "mirrored draft body" }],
+      },
+    ],
+  };
+
+  function versionRow(
+    overrides: Partial<DraftVersionRow> = {},
+  ): DraftVersionRow {
+    return {
+      id: "77777777-7777-7777-7777-777777777777",
+      workspaceId: WORKSPACE_ID,
+      draftId: DRAFT_ID,
+      versionNo: 2n,
+      sourceRevision: 3n,
+      subject: "Mirrored subject",
+      bodyJson: SNAPSHOT_DOC,
+      createdAt: new Date("2026-07-02T08:30:00Z"),
+      ...overrides,
+    };
+  }
+
+  function makeResolver(rows: DraftVersionRow[] = [versionRow()]) {
+    const versions = new FakeDraftVersionRepo();
+    versions.rows.push(...rows);
+    const mailboxes = new FakeMailboxRepo();
+    mailboxes.rows.set(MAILBOX_ID, sendableMailbox());
+    return {
+      versions,
+      mailboxes,
+      resolver: new DraftVersionMirrorPayloadResolver({
+        draftVersions: versions,
+        mailboxes,
+      }),
+    };
+  }
+
+  it("builds a deterministic MIME from the exact immutable revision", async () => {
+    const { resolver } = makeResolver();
+    const payload = await resolver.resolve(job(3n));
+    expect(payload).not.toBeNull();
+    expect(payload!.revision).toBe(3n);
+    const raw = payload!.mime.toString("utf8");
+    expect(raw).toContain("Subject: Mirrored subject");
+    expect(raw).toContain("From: sender@mail.example.com");
+    expect(raw).toContain("mirrored draft body");
+    // Deterministic, non-routable, revision-scoped Message-ID; pinned Date
+    // from the immutable snapshot timestamp → idempotent rebuilds.
+    expect(raw).toContain(`Message-ID: <draft-${DRAFT_ID}.r3@mirror.invalid>`);
+    expect(raw).toContain("Date: Thu, 02 Jul 2026 08:30:00 +0000");
+    const again = await resolver.resolve(job(3n));
+    expect(again!.mime.toString("utf8")).toContain(
+      "Date: Thu, 02 Jul 2026 08:30:00 +0000",
+    );
+  });
+
+  it("fails closed (null) when the exact revision snapshot is missing", async () => {
+    const { resolver } = makeResolver([versionRow({ sourceRevision: 2n })]);
+    expect(await resolver.resolve(job(3n))).toBeNull();
+  });
+
+  it("fails closed (null) when the snapshot table is unreadable", async () => {
+    const { versions, resolver } = makeResolver();
+    versions.failWith = new Error("permission denied");
+    expect(await resolver.resolve(job(3n))).toBeNull();
+  });
+
+  it("fails closed (null) on an invalid snapshot body or missing mailbox", async () => {
+    const invalid = makeResolver([versionRow({ bodyJson: { type: "nope" } })]);
+    expect(await invalid.resolver.resolve(job(3n))).toBeNull();
+
+    const { resolver, mailboxes } = makeResolver();
+    mailboxes.rows.clear();
+    expect(await resolver.resolve(job(3n))).toBeNull();
+  });
+
+  it("drives the executor end-to-end: mirrored via IMAP only, zero SMTP", async () => {
+    const { resolver } = makeResolver();
+    const mailboxes = new FakeMailboxRepo();
+    mailboxes.rows.set(MAILBOX_ID, sendableMailbox());
+    const mirrors = new FakeDraftMirrorRepo();
+    const server = new FakeImapServer();
+    server.addFolder({ name: "Drafts", role: "drafts", uidvalidity: 7n });
+    const factory = new FakeProviderFactory(server, new FakeSmtpClient());
+    const exec = new DraftMirrorExecutor({
+      mailboxes,
+      mirrors,
+      audit: new FakeAuditRepo(),
+      providerFactory: factory,
+      payloadResolver: resolver,
+      logger: new JsonLogger({ level: "error", sink: { write: () => {} } }),
+      config: { draftsFolder: "Drafts" },
+    });
+    expect(await exec.execute(job(3n))).toBe("mirrored");
+    const row = await mirrors.getByDraftAndMailbox(DRAFT_ID, MAILBOX_ID);
+    expect(row?.mirroredRevision).toBe(3n);
+    expect(factory.imapSessionsCreated).toBe(1);
+    expect(factory.submissionsCreated).toBe(0);
+
+    // A missing revision fails closed through the executor too.
+    expect(await exec.execute(job(9n))).toBe("skipped_missing_payload");
+    expect(factory.submissionsCreated).toBe(0);
   });
 });

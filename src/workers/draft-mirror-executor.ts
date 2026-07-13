@@ -27,9 +27,14 @@ export interface DraftPayload {
   readonly mime: Buffer;
 }
 
-/** Reconstructs the exact draft MIME for a (draftId, revision). */
+/**
+ * Reconstructs the exact draft MIME for the job's (workspace, mailbox, draft,
+ * immutable revision). Returns null when the payload cannot be reconstructed
+ * — the executor then fails CLOSED (skipped_missing_payload): nothing is
+ * appended and nothing is retired.
+ */
 export interface DraftPayloadResolver {
-  resolve(draftId: string, revision: bigint): Promise<DraftPayload | null>;
+  resolve(job: DraftMirrorJobInput): Promise<DraftPayload | null>;
 }
 
 export interface DraftMirrorExecutorDeps {
@@ -79,10 +84,7 @@ export class DraftMirrorExecutor {
       return "skipped_stale";
     }
 
-    const payload = await this.deps.payloadResolver.resolve(
-      job.draftId,
-      job.revision,
-    );
+    const payload = await this.deps.payloadResolver.resolve(job);
     if (payload === null) {
       log.warn("draft_mirror_missing_payload");
       return "skipped_missing_payload";

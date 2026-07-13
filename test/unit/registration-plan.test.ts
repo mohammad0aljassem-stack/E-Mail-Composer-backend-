@@ -83,14 +83,38 @@ describe("plannedRegistrations (fail-closed capability gating)", () => {
       sendMessage: false,
       draftMirror: false,
     });
-  });
-
-  it("draft_mirror is NEVER planned in this phase, even with its flag on", () => {
-    const plan = plannedRegistrations(
+    const mirror = plannedRegistrations(
       cfg({ transportEnabled: true, draftMirrorEnabled: true }),
     );
-    // Slice 3 registers the draft_mirror handler behind draftMirrorEnabled;
-    // until then the plan must keep it unregistered.
+    expect(mirror).toEqual({
+      syncMailbox: false,
+      syncDispatcher: false,
+      applyMutation: false,
+      sendMessage: false,
+      draftMirror: true,
+    });
+  });
+
+  it("C6: a Gate-F config (master + sync only) never registers draft_mirror", () => {
+    const plan = plannedRegistrations(
+      cfg({ transportEnabled: true, syncEnabled: true }),
+    );
     expect(plan.draftMirror).toBe(false);
+  });
+
+  it("C6: draft_mirror registers ONLY with master + MAIL_DRAFT_MIRROR_ENABLED", () => {
+    expect(
+      plannedRegistrations(
+        cfg({ transportEnabled: true, draftMirrorEnabled: true }),
+      ).draftMirror,
+    ).toBe(true);
+    // Flag alone (master off) stays fail-closed.
+    expect(
+      plannedRegistrations(cfg({ draftMirrorEnabled: true })).draftMirror,
+    ).toBe(false);
+    // Master alone (flag off) stays fail-closed.
+    expect(
+      plannedRegistrations(cfg({ transportEnabled: true })).draftMirror,
+    ).toBe(false);
   });
 });

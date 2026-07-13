@@ -190,6 +190,8 @@ describe("C1 — SMTP capability is confined to the submission factory path", ()
     "src/workers/sync-executor.ts",
     "src/workers/mutation-executor.ts",
     "src/workers/draft-mirror-executor.ts",
+    "src/workers/draft-mirror-payload-resolver.ts",
+    "src/workers/send-payload-resolver.ts",
     "src/workers/sync-request-dispatcher.ts",
   ];
 
@@ -288,6 +290,23 @@ describe("C4 — the production send-payload resolver is real (no stub)", () => 
     const resolver = code.indexOf("new DraftVersionSendPayloadResolver");
     expect(gate).toBeGreaterThanOrEqual(0);
     expect(resolver).toBeGreaterThan(gate);
+  });
+});
+
+describe("C6 — draft mirroring registers only behind its capability flag", () => {
+  it("the registration plan gates draftMirror on master && draftMirrorEnabled", () => {
+    const code = read("src/entrypoints/registration-plan.ts");
+    expect(
+      /draftMirror:\s*master\s*&&\s*config\.draftMirrorEnabled/.test(code),
+    ).toBe(true);
+  });
+
+  it("worker.ts registers the draft_mirror handler inside the plan.draftMirror branch", () => {
+    const code = codeLines(read("src/entrypoints/worker.ts")).join("\n");
+    const gate = code.indexOf("if (plan.draftMirror)");
+    const registration = code.indexOf("QUEUE_NAMES.draftMirror");
+    expect(gate).toBeGreaterThanOrEqual(0);
+    expect(registration).toBeGreaterThan(gate);
   });
 });
 

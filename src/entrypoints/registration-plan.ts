@@ -13,8 +13,9 @@ import type { TransportConfig } from "../config/env.js";
  *  - a sub-capability registers ONLY its own handler(s) — Gate F: master +
  *    sync alone yields exactly the sync handler + dispatcher and no code path
  *    that could construct an SMTP client;
- *  - draft_mirror is NEVER registered in this phase (slice 3 registers it
- *    behind draftMirrorEnabled; the flag already exists and defaults false).
+ *  - draft_mirror registers ONLY behind master + MAIL_DRAFT_MIRROR_ENABLED
+ *    (defaults false → fail-closed). The mirror handler is IMAP-only: it can
+ *    never create a send intent or construct an SMTP client.
  */
 
 export type CapabilityConfig = Pick<
@@ -45,8 +46,6 @@ export function plannedRegistrations(
     syncDispatcher: sync,
     applyMutation: master && config.mutationsEnabled,
     sendMessage: master && config.sendEnabled,
-    // Slice 3 (draft-mirror registration) flips this to
-    // `master && config.draftMirrorEnabled`; until then: never registered.
-    draftMirror: false,
+    draftMirror: master && config.draftMirrorEnabled,
   };
 }
