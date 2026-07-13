@@ -17,6 +17,10 @@ The worker validates configuration at startup via `src/config/env.ts` and
 | `CLAIM_LEASE_MS`                                  | `60000`        | no             | Send-claim lease duration.                                                                                                |
 | `SMTP_TIMEOUT_MS`                                 | `30000`        | no             | SMTP connect/greeting/socket timeout.                                                                                     |
 | `IMAP_COMMAND_TIMEOUT_MS`                         | `30000`        | no             | IMAP greeting/socket timeout.                                                                                             |
+| `SYNC_DISPATCH_INTERVAL_MS`                       | `5000`         | no             | Durable `transport.sync_requests` dispatcher poll interval (see ADR 0006).                                                |
+| `SYNC_CLAIM_LEASE_MS`                             | `300000`       | no             | Durable sync-request stale-claim lease; a `claimed` row older than this is reclaimable.                                   |
+| `SYNC_CLAIM_BATCH_SIZE`                           | `10`           | no             | Max durable sync-requests claimed per dispatch pass.                                                                      |
+| `SYNC_MAX_ATTEMPTS`                               | `5`            | no             | Hard cap on durable re-claims before a stale sync-request is failed.                                                      |
 | `PROVISION_WORKSPACE_ID` / `PROVISION_MAILBOX_ID` | —              | CLI only       | Used by the test-only provisioning CLI.                                                                                   |
 
 ## Fail-closed rules

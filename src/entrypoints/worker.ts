@@ -20,13 +20,14 @@ import {
   MessageRepository,
   SendAttemptRepository,
   SendIntentRepository,
+  SyncRequestRepository,
   WorkerClaimRepository,
 } from "../db/repositories.js";
 import { checkHealth } from "../health/health.js";
 import { Heartbeat } from "../observability/heartbeat.js";
 import { JsonLogger } from "../observability/logger.js";
 import { QueueManager } from "../queues/queue-manager.js";
-import { QUEUE_NAMES } from "../queues/queue-config.js";
+import { QUEUE_DEFINITIONS, QUEUE_NAMES } from "../queues/queue-config.js";
 import type {
   ApplyMutationJob,
   SendMessageJob,
@@ -35,8 +36,9 @@ import type {
 import { ImapSmtpProviderFactory } from "../workers/provider-factory.js";
 import { SendExecutor } from "../workers/send-executor.js";
 import { SyncExecutor } from "../workers/sync-executor.js";
+import { SyncRequestDispatcher } from "../workers/sync-request-dispatcher.js";
 import { MutationExecutor } from "../workers/mutation-executor.js";
-import type { Job } from "pg-boss";
+import type { Job, JobWithMetadata } from "pg-boss";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -75,6 +77,8 @@ async function main(): Promise<void> {
   });
   await queues.start();
   heartbeat.start();
+
+  let dispatchTimer: ReturnType<typeof setInterval> | null = null;
 
   if (!config.transportEnabled) {
     // Fail-closed: no work handlers, no provider, no decryption.
@@ -132,10 +136,51 @@ async function main(): Promise<void> {
       providerFactory,
       logger,
     });
+
+    // Durable transport.sync_requests consumer/dispatcher (B3/B4). The worker
+    // holds only SELECT+UPDATE on the table; the DEFINER RPC inserts. Runs only
+    // because the transport flag is on (this whole branch is flag-gated).
+    const dispatcher = new SyncRequestDispatcher({
+      syncRequests: new SyncRequestRepository(db),
+      mailboxes: new MailboxRepository(db),
+      enqueueSync: (job) => queues.enqueueSyncForRequest(job),
+      clock,
+      logger,
+      config: {
+        transportEnabled: config.transportEnabled,
+        globalKillSwitch: config.globalKillSwitch,
+        batchSize: config.syncClaimBatchSize,
+        leaseMs: config.syncClaimLeaseMs,
+        maxAttempts: config.syncMaxAttempts,
+      },
+    });
+    const syncRetryLimit =
+      QUEUE_DEFINITIONS[QUEUE_NAMES.syncMailbox].retryLimit ?? 0;
+
     await queues.instance.work(
       QUEUE_NAMES.syncMailbox,
-      async (jobs: Job<SyncMailboxJob>[]) => {
-        for (const job of jobs) await syncExec.execute(job.data);
+      { includeMetadata: true },
+      async (jobs: JobWithMetadata<SyncMailboxJob>[]) => {
+        for (const job of jobs) {
+          const requestId = job.data.syncRequestId;
+          try {
+            await syncExec.execute(job.data);
+            // Mark the durable request completed ONLY after the sync completed.
+            if (requestId !== undefined) {
+              await dispatcher.markCompleted(requestId);
+            }
+          } catch (err) {
+            // Terminal-fail the durable request on the FINAL pg-boss attempt so
+            // durable re-claims and pg-boss retries never multiply. Content-free
+            // code only. Re-throw so pg-boss records the job failure too.
+            if (requestId !== undefined && job.retryCount >= syncRetryLimit) {
+              await dispatcher
+                .markFailed(requestId, "sync_failed")
+                .catch(() => undefined);
+            }
+            throw err;
+          }
+        }
       },
     );
     await queues.instance.work(
@@ -180,6 +225,18 @@ async function main(): Promise<void> {
     // draft_mirror worker intentionally not registered by default in 3A
     // (queue exists; the DraftMirrorExecutor + its tests are complete).
 
+    // Poll-drive the durable sync-request dispatcher. This is NOT a scheduler:
+    // it only claims already-persisted requests and enqueues pg-boss jobs; it
+    // never creates work from SQL and never polls transport_audit.
+    dispatchTimer = setInterval(() => {
+      void dispatcher.dispatchOnce().catch((err: unknown) => {
+        logger.error("sync_dispatch_failed", {
+          error: err instanceof Error ? err.name : "unknown",
+        });
+      });
+    }, config.syncDispatchIntervalMs);
+    dispatchTimer.unref?.();
+
     logger.info("workers_registered");
   }
 
@@ -189,6 +246,7 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     logger.info("shutdown_begin", { signal });
+    if (dispatchTimer !== null) clearInterval(dispatchTimer);
     void (async (): Promise<void> => {
       await queues.stop().catch(() => undefined);
       await heartbeat.stop().catch(() => undefined);

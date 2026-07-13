@@ -321,6 +321,67 @@ describe("SendExecutor — Sent copy reconciliation", () => {
   });
 });
 
+describe("SendExecutor — authoritative sender at execution (B5)", () => {
+  // Sender matches the mailbox address (after normalization) → proceeds + sends.
+  it("proceeds when the intent sender matches the mailbox address", async () => {
+    const h = await makeHarness();
+    // Prove normalization is applied: mixed case + surrounding space still match.
+    h.deps.mailboxes = new FakeMailboxRepo();
+    (h.deps.mailboxes as FakeMailboxRepo).rows.set(
+      h.fixture.intent.mailboxId,
+      sendableMailbox({ emailAddress: "  Sender@Mail.Example.com " }),
+    );
+    h.exec = new SendExecutor(h.deps);
+    const outcome = await h.exec.execute(JOB);
+    expect(outcome).toBe("completed");
+    expect(h.smtp.submissions).toHaveLength(1);
+  });
+
+  // Mismatch → failed_before_delivery BEFORE any SMTP byte, content-free reason.
+  it("fails closed before SMTP when the sender does not match the mailbox", async () => {
+    const h = await makeHarness({
+      mailboxOverrides: { emailAddress: "someone-else@example.com" },
+    });
+    const outcome = await h.exec.execute(JOB);
+    expect(outcome).toBe("failed_before_delivery");
+    // ZERO SMTP bytes submitted.
+    expect(h.smtp.submissions).toHaveLength(0);
+    expect(h.attempts.rows.get(ATTEMPT_ID)?.state).toBe(
+      "failed_before_delivery",
+    );
+    // Content-free failure code only.
+    expect(h.attempts.rows.get(ATTEMPT_ID)?.evidence.reason).toBe(
+      "sender_authority_mismatch",
+    );
+  });
+
+  // Mismatch is terminal-for-this-attempt: the executor never re-enqueues, and
+  // the send queue is retryLimit 0, so there is no auto-retry.
+  it("does not auto-retry or re-enqueue on a sender mismatch", async () => {
+    const h = await makeHarness({
+      mailboxOverrides: { emailAddress: "someone-else@example.com" },
+    });
+    await h.exec.execute(JOB);
+    // A second execution sees a non-terminal failed_before_delivery but STILL
+    // never sends (sender is still wrong); no SMTP is ever submitted.
+    await h.exec.execute(JOB);
+    expect(h.smtp.submissions).toHaveLength(0);
+  });
+
+  // A workspace mismatch on the loaded mailbox also fails closed.
+  it("fails closed when the mailbox belongs to a different workspace", async () => {
+    const h = await makeHarness({
+      mailboxOverrides: { workspaceId: "99999999-9999-9999-9999-999999999999" },
+    });
+    const outcome = await h.exec.execute(JOB);
+    expect(outcome).toBe("failed_before_delivery");
+    expect(h.smtp.submissions).toHaveLength(0);
+    expect(h.attempts.rows.get(ATTEMPT_ID)?.evidence.reason).toBe(
+      "sender_authority_workspace_mismatch",
+    );
+  });
+});
+
 // Test 37: end-to-end, no body/credential/attachment bytes appear in logs.
 describe("SendExecutor — content-free logging", () => {
   it("never logs body/credential/attachment content", async () => {

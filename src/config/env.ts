@@ -30,6 +30,14 @@ export interface TransportConfig {
   readonly claimLeaseMs: number;
   readonly smtpTimeoutMs: number;
   readonly imapCommandTimeoutMs: number;
+  /** Durable sync_requests dispatcher: poll interval. */
+  readonly syncDispatchIntervalMs: number;
+  /** Durable sync_requests: stale-claim lease timeout. */
+  readonly syncClaimLeaseMs: number;
+  /** Durable sync_requests: max requests claimed per pass. */
+  readonly syncClaimBatchSize: number;
+  /** Durable sync_requests: hard cap on durable re-claims before failed. */
+  readonly syncMaxAttempts: number;
 }
 
 function bool(value: string | undefined, fallback: boolean): boolean {
@@ -172,5 +180,21 @@ export function loadConfig(
       30_000,
       "IMAP_COMMAND_TIMEOUT_MS",
     ),
+    syncDispatchIntervalMs: int(
+      env.SYNC_DISPATCH_INTERVAL_MS,
+      5_000,
+      "SYNC_DISPATCH_INTERVAL_MS",
+    ),
+    syncClaimLeaseMs: int(
+      env.SYNC_CLAIM_LEASE_MS,
+      300_000,
+      "SYNC_CLAIM_LEASE_MS",
+    ),
+    syncClaimBatchSize: int(
+      env.SYNC_CLAIM_BATCH_SIZE,
+      10,
+      "SYNC_CLAIM_BATCH_SIZE",
+    ),
+    syncMaxAttempts: int(env.SYNC_MAX_ATTEMPTS, 5, "SYNC_MAX_ATTEMPTS"),
   };
 }

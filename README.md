@@ -3,8 +3,13 @@
 A production-quality, **fully locally-testable** foundation for the IMAP/SMTP
 transport worker. This repository owns the **backend worker**; the canonical
 database schema and all deployable migrations are owned by the sibling UI repo
-(`E-Mail-Composer-UI`, merged commit `67daad9`; transport migration sha256
-`a2319ada8d471d09063b8e2bfbdb8c814e4ba49cecdee08c9bbd9b800aa8c72a`).
+(`E-Mail-Composer-UI`, merged commit `422485af44fa4606a7c0dbee798a9866b3fd0d8e`).
+The three Phase 3 migrations are checksum-pinned and verified fail-closed in CI
+and `scripts/test-db.sh`: transport foundation
+`a2319ada8d471d09063b8e2bfbdb8c814e4ba49cecdee08c9bbd9b800aa8c72a`, contract
+hardening `ee064f0b50d01897b8247a10edefc95bd0088862e3731693b19da7c851253977`,
+worker-transition grant
+`ca15b9de01894ef784fad57f991a052e2da1fcdca435cc1a78463af34b3c0dba`.
 
 > **Production remains DISABLED.** `MAIL_TRANSPORT_V1_ENABLED` defaults `false`.
 > With the flag off the worker starts NO IMAP/SMTP connection, runs NO send
@@ -79,10 +84,12 @@ pnpm audit --prod --audit-level high
 ```
 
 `scripts/test-db.sh` is **test-only and non-deployable**: it loads the sibling
-repo's baseline + three migrations into a throwaway cluster and creates a local
-`transport_worker` login. It does not own migrations. (It also applies one
-`GRANT EXECUTE` the worker role needs to advance the send state machine — a
-real production provisioning requirement, see the runbook.)
+repo's baseline + the FULL five-migration chain into a throwaway cluster and
+creates a local `transport_worker` login (login + connect only). It does not own
+migrations, and it injects **no** privilege grants — the canonical
+worker-transition grant migration (20260715100000) already gives the worker role
+the one `EXECUTE` it needs to advance the send state machine, so integration
+tests run under the real least-privilege role with nothing added.
 
 ## Key safety properties
 
@@ -114,6 +121,7 @@ real production provisioning requirement, see the runbook.)
 | [docs/adr/0003-safe-send.md](docs/adr/0003-safe-send.md)                         | Safe-send state machine             |
 | [docs/adr/0004-credential-encryption.md](docs/adr/0004-credential-encryption.md) | Credential cipher                   |
 | [docs/adr/0005-imap-sync.md](docs/adr/0005-imap-sync.md)                         | IMAP sync + UIDVALIDITY             |
+| [docs/adr/0006-durable-sync-requests.md](docs/adr/0006-durable-sync-requests.md) | Durable claimable sync requests     |
 | [docs/testing-and-failure-injection.md](docs/testing-and-failure-injection.md)   | Test map + fakes                    |
 | [docs/security-review.md](docs/security-review.md)                               | Phase 3A security review            |
 | [docs/phase-3b-checklist.md](docs/phase-3b-checklist.md)                         | Controlled-IONOS rollout            |

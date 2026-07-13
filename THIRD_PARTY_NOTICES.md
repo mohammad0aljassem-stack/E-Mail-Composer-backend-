@@ -48,6 +48,12 @@ AGPL/GPL/LGPL/SSPL/BUSL/unknown license.
   neither shipped nor modified by this project. It is explicitly allowed by the
   policy; AGPL is not.
 - The canonical database schema is owned by the sibling UI repository
-  (`E-Mail-Composer-UI`) at merged commit `67daad9`; the transport migration's
-  sha256 is `a2319ada8d471d09063b8e2bfbdb8c814e4ba49cecdee08c9bbd9b800aa8c72a`.
-  This backend does not vendor or re-own those migrations.
+  (`E-Mail-Composer-UI`) at merged commit
+  `422485af44fa4606a7c0dbee798a9866b3fd0d8e`. The three Phase 3 migrations are
+  checksum-pinned: transport foundation (20260713100000)
+  `a2319ada8d471d09063b8e2bfbdb8c814e4ba49cecdee08c9bbd9b800aa8c72a`, contract
+  hardening (20260714100000)
+  `ee064f0b50d01897b8247a10edefc95bd0088862e3731693b19da7c851253977`, and the
+  worker-transition grant (20260715100000)
+  `ca15b9de01894ef784fad57f991a052e2da1fcdca435cc1a78463af34b3c0dba`. This
+  backend does not vendor or re-own those migrations.

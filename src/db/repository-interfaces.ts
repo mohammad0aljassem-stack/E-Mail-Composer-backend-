@@ -6,6 +6,7 @@ import type {
   SendAttemptRow,
   SendIntentRow,
   StoredCredential,
+  SyncRequestRow,
 } from "../domain/models.js";
 import type { SendState } from "../domain/send-state.js";
 
@@ -120,4 +121,54 @@ export interface AuditWriter {
 
 export interface HeartbeatWriter {
   beat(workerId: string, state: string | null): Promise<void>;
+}
+
+/**
+ * Durable sync-request consumer store (transport.sync_requests). The worker has
+ * exactly SELECT + UPDATE — NO INSERT/DELETE (the DEFINER RPC inserts). Every
+ * method is a single atomic statement; `claimBatch` is a concurrency-safe
+ * `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED)` so at most one
+ * worker claims any one request.
+ */
+export interface SyncRequestStore {
+  /**
+   * Atomically claim up to `limit` requests. Eligible rows are `pending` OR
+   * `claimed` whose `claimedAt < leaseCutoff` (a STALE claim past the lease —
+   * reclaimable crash recovery) AND `attemptCount < maxAttempts`. Each claimed
+   * row moves to `claimed`, sets `claimedAt = now`, and increments
+   * `attemptCount`. A FRESH claim (recent `claimedAt`) is never stolen.
+   */
+  claimBatch(input: {
+    limit: number;
+    now: Date;
+    leaseCutoff: Date;
+    maxAttempts: number;
+  }): Promise<SyncRequestRow[]>;
+
+  /** Terminal success: `claimed -> completed`, set `completedAt`. Idempotent. */
+  markCompleted(id: string, now: Date): Promise<SyncRequestRow | null>;
+
+  /**
+   * Terminal failure: `claimed|pending -> failed`, set `completedAt` and a
+   * bounded, content-free `lastError` code. Idempotent.
+   */
+  markFailed(input: {
+    id: string;
+    now: Date;
+    lastError: string;
+  }): Promise<SyncRequestRow | null>;
+
+  /**
+   * Sweep STALE `claimed` rows whose `attemptCount >= maxAttempts` to `failed`
+   * with a bounded content-free code. Returns the number reaped. This is the
+   * terminal bound on durable re-claims.
+   */
+  reapExhausted(input: {
+    now: Date;
+    leaseCutoff: Date;
+    maxAttempts: number;
+    lastError: string;
+  }): Promise<number>;
+
+  getById(id: string): Promise<SyncRequestRow | null>;
 }

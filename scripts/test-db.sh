@@ -4,10 +4,17 @@
 #
 # NON-DEPLOYABLE. This does NOT own or ship migrations. The canonical migrations
 # live in the sibling UI repo (single owner). Here we merely load, into a
-# throwaway PG16 cluster, the exact baseline + three migrations at the merged
-# UI SHA 67daad9 so the worker's repositories/queues can be tested against the
-# real schema, and we create a LOCAL, least-privileged `transport_worker` login
-# role. Production provisioning of that role is a SEPARATE, manual, audited op.
+# throwaway PG16 cluster, the exact baseline + FULL Phase 2/3 migration chain at
+# the merged UI SHA 422485af44fa4606a7c0dbee798a9866b3fd0d8e so the worker's
+# repositories/queues can be tested against the real schema, and we create a
+# LOCAL, least-privileged `transport_worker` login role. Production provisioning
+# of that role is a SEPARATE, manual, audited op.
+#
+# The FULL canonical chain (all FIVE migrations) is loaded and every Phase 3
+# migration is checksum-pinned. This FAILS CLOSED if the UI checkout SHA differs,
+# any expected migration file is missing, any checksum differs, or the schema
+# would otherwise be loaded through PR#4 alone (i.e. without the Phase 3 contract
+# hardening + the worker-transition grant migrations).
 #
 # Usage:
 #   bash scripts/test-db.sh            # start (reuse if running), load schema
@@ -22,15 +29,23 @@ PORT="${TEST_DB_PORT:-54330}"
 DB_NAME="${TEST_DB_NAME:-transport_test}"
 WORKER_ROLE="transport_worker"
 WORKER_PASS="${TEST_WORKER_PASSWORD:-worker_test_pw}"
-EXPECTED_TRANSPORT_SHA="a2319ada8d471d09063b8e2bfbdb8c814e4ba49cecdee08c9bbd9b800aa8c72a"
+
+# --- Canonical pin (UI Workstream A merged) ---------------------------------
+# Full 40-char merged UI SHA. The three Phase 3 migrations are pinned by sha256.
+EXPECTED_UI_SHA="422485af44fa4606a7c0dbee798a9866b3fd0d8e"
+EXPECTED_FOUNDATION_SHA="a2319ada8d471d09063b8e2bfbdb8c814e4ba49cecdee08c9bbd9b800aa8c72a"
+EXPECTED_HARDENING_SHA="ee064f0b50d01897b8247a10edefc95bd0088862e3731693b19da7c851253977"
+EXPECTED_GRANT_SHA="ca15b9de01894ef784fad57f991a052e2da1fcdca435cc1a78463af34b3c0dba"
 
 MODE="${1:-}"
 PSQL_ARGS=(-U postgres -p "$PORT" -h localhost)
 
 BASELINE="$UI_REPO/supabase/baseline/production_schema_2026_07_11.sql"
 MIG_DRAFT="$UI_REPO/supabase/migrations/20260711130000_draft_lifecycle.sql"
-MIG_HARDEN="$UI_REPO/supabase/migrations/20260712100000_enforce_phase2_rpc_invariants.sql"
-MIG_TRANSPORT="$UI_REPO/supabase/migrations/20260713100000_transport_foundation.sql"
+MIG_PHASE2="$UI_REPO/supabase/migrations/20260712100000_enforce_phase2_rpc_invariants.sql"
+MIG_FOUNDATION="$UI_REPO/supabase/migrations/20260713100000_transport_foundation.sql"
+MIG_HARDENING="$UI_REPO/supabase/migrations/20260714100000_transport_contract_hardening.sql"
+MIG_GRANT="$UI_REPO/supabase/migrations/20260715100000_worker_transition_grant.sql"
 
 if ! command -v initdb >/dev/null 2>&1; then
   PG_BIN="$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1 || true)"
@@ -62,21 +77,43 @@ if [ "$MODE" = "--stop" ]; then
   exit 0
 fi
 
-# --- verify the sibling repo + migration checksum before doing anything ------
-for f in "$BASELINE" "$MIG_DRAFT" "$MIG_HARDEN" "$MIG_TRANSPORT"; do
+# --- FAIL CLOSED: verify the sibling repo, its SHA, and every checksum -------
+# 1. Every file in the FULL chain must be present (a missing hardening/grant
+#    migration means the schema could only be loaded through PR#4 — reject it).
+for f in "$BASELINE" "$MIG_DRAFT" "$MIG_PHASE2" "$MIG_FOUNDATION" "$MIG_HARDENING" "$MIG_GRANT"; do
   if [ ! -f "$f" ]; then
     echo "ERROR: required schema file missing: $f" >&2
-    echo "Set UI_REPO to the sibling UI checkout at merged SHA 67daad9." >&2
+    echo "Set UI_REPO to the sibling UI checkout at merged SHA $EXPECTED_UI_SHA (full chain)." >&2
     exit 1
   fi
 done
-ACTUAL_SHA="$(sha256sum "$MIG_TRANSPORT" | awk '{print $1}')"
-if [ "$ACTUAL_SHA" != "$EXPECTED_TRANSPORT_SHA" ]; then
-  echo "ERROR: transport migration checksum mismatch." >&2
-  echo "  expected $EXPECTED_TRANSPORT_SHA" >&2
-  echo "  actual   $ACTUAL_SHA" >&2
-  exit 1
+
+# 2. If UI_REPO is a git checkout, its HEAD MUST be the pinned canonical SHA.
+if git -C "$UI_REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  ACTUAL_UI_SHA="$(git -C "$UI_REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
+  if [ "$ACTUAL_UI_SHA" != "$EXPECTED_UI_SHA" ]; then
+    echo "ERROR: UI schema checkout SHA mismatch." >&2
+    echo "  expected $EXPECTED_UI_SHA" >&2
+    echo "  actual   $ACTUAL_UI_SHA" >&2
+    exit 1
+  fi
 fi
+
+# 3. All THREE Phase 3 checksums must match exactly (foundation, hardening, grant).
+verify_sha() {
+  local label="$1" file="$2" expected="$3" actual
+  actual="$(sha256sum "$file" | awk '{print $1}')"
+  if [ "$actual" != "$expected" ]; then
+    echo "ERROR: $label migration checksum mismatch." >&2
+    echo "  expected $expected" >&2
+    echo "  actual   $actual" >&2
+    exit 1
+  fi
+}
+verify_sha "foundation (20260713100000)" "$MIG_FOUNDATION" "$EXPECTED_FOUNDATION_SHA"
+verify_sha "hardening  (20260714100000)" "$MIG_HARDENING" "$EXPECTED_HARDENING_SHA"
+verify_sha "grant      (20260715100000)" "$MIG_GRANT" "$EXPECTED_GRANT_SHA"
+echo "Canonical pin verified: UI $EXPECTED_UI_SHA, all 3 Phase 3 checksums OK."
 
 if check_running; then
   echo "Reusing PostgreSQL already running on port $PORT."
@@ -99,24 +136,25 @@ apply() {
   echo "  applying $(basename "$2")"
   psql "${PSQL_ARGS[@]}" -d "$DB_NAME" -v ON_ERROR_STOP=1 -q -f "$2" >/dev/null
 }
-echo "Loading canonical schema (baseline + 3 migrations @ UI 67daad9)..."
+echo "Loading canonical schema (baseline + FULL 5-migration chain @ UI 422485a)..."
 apply baseline "$BASELINE"
 apply draft "$MIG_DRAFT"
-apply harden "$MIG_HARDEN"
-apply transport "$MIG_TRANSPORT"
+apply phase2 "$MIG_PHASE2"
+apply foundation "$MIG_FOUNDATION"
+apply hardening "$MIG_HARDENING"
+apply grant "$MIG_GRANT"
 
-# --- TEST-ONLY: give the worker role a local login + a scratch pg-boss owner --
-echo "Configuring TEST-ONLY worker login role (non-production)..."
-# NOTE (production provisioning requirement, surfaced by integration testing):
-# the send_attempts BEFORE UPDATE trigger is SECURITY INVOKER and calls
-# public.phase3_send_attempt_transition_ok(text,text). The canonical migration
-# grants EXECUTE on that function to service_role only, so a bare transport_worker
-# CANNOT advance the send state machine without this grant. Production
-# provisioning of the worker role MUST include it (documented in the runbook).
+# --- TEST-ONLY: give the worker role a local login only ----------------------
+# NO privilege injection here. The canonical worker-transition grant migration
+# (20260715100000) already grants transport_worker EXECUTE on
+# public.phase3_send_attempt_transition_ok(text,text), so the SECURITY INVOKER
+# BEFORE UPDATE trigger on send_attempts can advance the state machine under the
+# real least-privilege role WITHOUT any test-only GRANT. We add ONLY a login +
+# CONNECT so the integration suite can authenticate as the role.
+echo "Configuring TEST-ONLY worker login role (login+connect only, no grants)..."
 psql "${PSQL_ARGS[@]}" -d "$DB_NAME" -v ON_ERROR_STOP=1 -q \
   -c "ALTER ROLE $WORKER_ROLE LOGIN PASSWORD '$WORKER_PASS';" \
-  -c "GRANT CONNECT ON DATABASE $DB_NAME TO $WORKER_ROLE;" \
-  -c "GRANT EXECUTE ON FUNCTION public.phase3_send_attempt_transition_ok(text, text) TO $WORKER_ROLE;"
+  -c "GRANT CONNECT ON DATABASE $DB_NAME TO $WORKER_ROLE;"
 
 echo "Schema loaded."
 if [ "$MODE" = "--print" ]; then

@@ -6,6 +6,7 @@ import type {
   SendAttemptRow,
   SendIntentRow,
   StoredCredential,
+  SyncRequestRow,
 } from "../domain/models.js";
 import type { SendState } from "../domain/send-state.js";
 import type {
@@ -18,6 +19,7 @@ import type {
   MessageStore,
   SendAttemptStore,
   SendIntentReader,
+  SyncRequestStore,
   WorkerClaimStore,
 } from "./repository-interfaces.js";
 import type { Queryable } from "./pool.js";
@@ -589,6 +591,135 @@ export class AuditRepository implements AuditWriter {
       ],
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Durable sync requests (transport.sync_requests) — worker SELECT + UPDATE only
+// ---------------------------------------------------------------------------
+export class SyncRequestRepository implements SyncRequestStore {
+  public constructor(private readonly db: Queryable) {}
+
+  /**
+   * Single-statement, concurrency-safe claim. The inner SELECT ... FOR UPDATE
+   * SKIP LOCKED locks only rows no other transaction holds, so two workers can
+   * never claim the same request; the outer UPDATE advances exactly those rows.
+   * Eligibility: pending, OR a STALE claim (claimed_at < leaseCutoff), always
+   * bounded by attempt_count < maxAttempts. Ordered by requested_at (FIFO) for
+   * baseline fairness; per-workspace execution fairness is the pg-boss job group.
+   */
+  public async claimBatch(input: {
+    limit: number;
+    now: Date;
+    leaseCutoff: Date;
+    maxAttempts: number;
+  }): Promise<SyncRequestRow[]> {
+    const r = await this.db.query(
+      `update transport.sync_requests s
+          set status = 'claimed',
+              claimed_at = $1,
+              attempt_count = s.attempt_count + 1
+        where s.id in (
+          select id from transport.sync_requests
+           where attempt_count < $4
+             and ( status = 'pending'
+                   or (status = 'claimed' and claimed_at < $2) )
+           order by requested_at
+           for update skip locked
+           limit $3
+        )
+      returning s.*`,
+      [input.now, input.leaseCutoff, input.limit, input.maxAttempts],
+    );
+    return r.rows.map((row) => this.map(row));
+  }
+
+  public async markCompleted(
+    id: string,
+    now: Date,
+  ): Promise<SyncRequestRow | null> {
+    const r = await this.db.query(
+      `update transport.sync_requests
+          set status = 'completed', completed_at = $2
+        where id = $1 and status = 'claimed'
+      returning *`,
+      [id, now],
+    );
+    const row = r.rows[0];
+    return row === undefined ? null : this.map(row);
+  }
+
+  public async markFailed(input: {
+    id: string;
+    now: Date;
+    lastError: string;
+  }): Promise<SyncRequestRow | null> {
+    const r = await this.db.query(
+      `update transport.sync_requests
+          set status = 'failed', completed_at = $2, last_error = $3
+        where id = $1 and status in ('claimed', 'pending')
+      returning *`,
+      [input.id, input.now, boundedCode(input.lastError)],
+    );
+    const row = r.rows[0];
+    return row === undefined ? null : this.map(row);
+  }
+
+  public async reapExhausted(input: {
+    now: Date;
+    leaseCutoff: Date;
+    maxAttempts: number;
+    lastError: string;
+  }): Promise<number> {
+    const r = await this.db.query(
+      `update transport.sync_requests
+          set status = 'failed', completed_at = $1, last_error = $4
+        where status = 'claimed'
+          and claimed_at < $2
+          and attempt_count >= $3
+      returning id`,
+      [
+        input.now,
+        input.leaseCutoff,
+        input.maxAttempts,
+        boundedCode(input.lastError),
+      ],
+    );
+    return r.rows.length;
+  }
+
+  public async getById(id: string): Promise<SyncRequestRow | null> {
+    const r = await this.db.query(
+      `select * from transport.sync_requests where id = $1`,
+      [id],
+    );
+    const row = r.rows[0];
+    return row === undefined ? null : this.map(row);
+  }
+
+  private map(row: Record<string, unknown>): SyncRequestRow {
+    return {
+      id: row.id as string,
+      workspaceId: row.workspace_id as string,
+      mailboxId: row.mailbox_id as string,
+      folder: (row.folder as string | null) ?? null,
+      status: row.status as SyncRequestRow["status"],
+      requestedBy: (row.requested_by as string | null) ?? null,
+      requestedAt: new Date(row.requested_at as string),
+      claimedAt: date(row.claimed_at),
+      completedAt: date(row.completed_at),
+      attemptCount: Number(row.attempt_count),
+      lastError: (row.last_error as string | null) ?? null,
+    };
+  }
+}
+
+/**
+ * Enforce the content-free, bounded invariant on last_error at the repository
+ * boundary too (belt and suspenders with the DB CHECK <= 2000): a short code
+ * only, never any body/MIME/credential/provider payload.
+ */
+function boundedCode(code: string): string {
+  return code.slice(0, 200);
 }
 
 // ---------------------------------------------------------------------------

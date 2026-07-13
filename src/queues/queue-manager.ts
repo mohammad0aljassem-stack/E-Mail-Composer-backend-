@@ -72,6 +72,26 @@ export class QueueManager {
     );
   }
 
+  /**
+   * Enqueue a sync_mailbox job that originated from a durable
+   * transport.sync_requests row. The singletonKey is DETERMINISTIC in the
+   * durable request id (not mailbox+folder), so re-dispatch after a crash / lease
+   * expiry can never create a duplicate job for the same request. Per-workspace
+   * fair concurrency is preserved via the pg-boss job group.
+   */
+  public async enqueueSyncForRequest(
+    job: SyncMailboxJob & { syncRequestId: string },
+  ): Promise<string | null> {
+    return this.boss.send(
+      QUEUE_NAMES.syncMailbox,
+      { ...job },
+      {
+        singletonKey: singletonKeys.syncRequest(job.syncRequestId),
+        group: { id: job.workspaceId },
+      },
+    );
+  }
+
   public async enqueueDraftMirror(job: DraftMirrorJob): Promise<string | null> {
     return this.boss.send(
       QUEUE_NAMES.draftMirror,
