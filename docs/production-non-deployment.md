@@ -11,8 +11,10 @@ enable transport in production.**
   Postgres and creates a **local** `transport_worker` login (login + connect
   only, **no injected grants**). It does **not** own or ship migrations — the
   sibling UI repo (`E-Mail-Composer-UI`, merged
-  `422485af44fa4606a7c0dbee798a9866b3fd0d8e`) is the single owner. It never
-  touches a hosted database.
+  `44c62c630b1db6bbdbcf5c95863bd3b896a77c99`) is the single owner. The expected
+  UI SHA and the migration checksums it enforces are read from
+  `config/canonical-transport-contract.lock.json` + the UI manifest, never
+  hand-copied. It never touches a hosted database.
 - The provisioning CLI is test-only and **refuses** production references
   (project ref `fpanvpxjjddhasjmpflz`, `*.supabase.co`). It encrypts only
   synthetic credentials and writes only ciphertext.
@@ -32,10 +34,10 @@ enable transport in production.**
 - **Phase 2 readiness remains a separate gate** and is unaffected by this PR.
 
 The schema this worker is built against is pinned to UI SHA
-`422485af44fa4606a7c0dbee798a9866b3fd0d8e` and the three Phase 3 migration
-checksums (foundation
-`a2319ada8d471d09063b8e2bfbdb8c814e4ba49cecdee08c9bbd9b800aa8c72a`, hardening
-`ee064f0b50d01897b8247a10edefc95bd0088862e3731693b19da7c851253977`, grant
-`ca15b9de01894ef784fad57f991a052e2da1fcdca435cc1a78463af34b3c0dba`); any
-mismatch — or a missing hardening/grant migration — fails `scripts/test-db.sh`
+`44c62c630b1db6bbdbcf5c95863bd3b896a77c99` via
+`config/canonical-transport-contract.lock.json`, and the three Phase 3 migration
+checksums are enforced against the UI's machine-readable manifest
+(`supabase/contracts/phase3-transport-contract.json`). Any mismatch — a wrong UI
+SHA, a changed manifest hash, a drifted migration checksum, or a missing
+hardening/grant migration — fails `pnpm contract:verify`, `scripts/test-db.sh`,
 and CI closed.

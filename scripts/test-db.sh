@@ -5,10 +5,10 @@
 # NON-DEPLOYABLE. This does NOT own or ship migrations. The canonical migrations
 # live in the sibling UI repo (single owner). Here we merely load, into a
 # throwaway PG16 cluster, the exact baseline + FULL Phase 2/3 migration chain at
-# the merged UI SHA 422485af44fa4606a7c0dbee798a9866b3fd0d8e so the worker's
-# repositories/queues can be tested against the real schema, and we create a
-# LOCAL, least-privileged `transport_worker` login role. Production provisioning
-# of that role is a SEPARATE, manual, audited op.
+# the merged UI SHA recorded in config/canonical-transport-contract.lock.json so
+# the worker's repositories/queues can be tested against the real schema, and we
+# create a LOCAL, least-privileged `transport_worker` login role. Production
+# provisioning of that role is a SEPARATE, manual, audited op.
 #
 # The FULL canonical chain (all FIVE migrations) is loaded and every Phase 3
 # migration is checksum-pinned. This FAILS CLOSED if the UI checkout SHA differs,
@@ -23,6 +23,7 @@
 # =============================================================================
 set -eu
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 UI_REPO="${UI_REPO:-/home/user/E-Mail-Composer-UI}"
 DATA_DIR="${TEST_DB_DATA_DIR:-/tmp/pg-transport-worker}"
 PORT="${TEST_DB_PORT:-54330}"
@@ -30,12 +31,22 @@ DB_NAME="${TEST_DB_NAME:-transport_test}"
 WORKER_ROLE="transport_worker"
 WORKER_PASS="${TEST_WORKER_PASSWORD:-worker_test_pw}"
 
-# --- Canonical pin (UI Workstream A merged) ---------------------------------
-# Full 40-char merged UI SHA. The three Phase 3 migrations are pinned by sha256.
-EXPECTED_UI_SHA="422485af44fa4606a7c0dbee798a9866b3fd0d8e"
-EXPECTED_FOUNDATION_SHA="a2319ada8d471d09063b8e2bfbdb8c814e4ba49cecdee08c9bbd9b800aa8c72a"
-EXPECTED_HARDENING_SHA="ee064f0b50d01897b8247a10edefc95bd0088862e3731693b19da7c851253977"
-EXPECTED_GRANT_SHA="ca15b9de01894ef784fad57f991a052e2da1fcdca435cc1a78463af34b3c0dba"
+# --- Canonical pin: SINGLE SOURCE = the backend lock + the UI manifest -------
+# The expected UI SHA comes from config/canonical-transport-contract.lock.json;
+# the per-migration checksums come from the checked-out UI manifest. NOTHING is
+# hand-copied here (no duplicated SHA/checksum literals to drift).
+LOCK_FILE="$SCRIPT_DIR/../config/canonical-transport-contract.lock.json"
+lock_get() {
+  node -e 'const fs=require("fs");const l=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));const v=l[process.argv[2]];if(v===undefined){process.exit(3)}process.stdout.write(String(v))' "$LOCK_FILE" "$1"
+}
+manifest_sha() {
+  # $1 = migration filename; prints its sha256 from the UI manifest (empty if absent).
+  node -e 'const fs=require("fs");const m=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));const e=(m.migrations||[]).find(x=>x&&x.file===process.argv[2]);process.stdout.write(e&&e.sha256?e.sha256:"")' "$MANIFEST_FILE" "$1"
+}
+
+EXPECTED_UI_SHA="$(lock_get uiCommitSha)"
+MANIFEST_REL="$(lock_get manifestPath)"
+MANIFEST_FILE="$UI_REPO/$MANIFEST_REL"
 
 MODE="${1:-}"
 PSQL_ARGS=(-U postgres -p "$PORT" -h localhost)
@@ -78,6 +89,17 @@ if [ "$MODE" = "--stop" ]; then
 fi
 
 # --- FAIL CLOSED: verify the sibling repo, its SHA, and every checksum -------
+# 0. The backend lock must have yielded a pin, and the UI manifest must exist.
+if [ -z "$EXPECTED_UI_SHA" ] || [ -z "$MANIFEST_REL" ]; then
+  echo "ERROR: could not read the pin from $LOCK_FILE." >&2
+  exit 1
+fi
+if [ ! -f "$MANIFEST_FILE" ]; then
+  echo "ERROR: canonical UI manifest missing: $MANIFEST_FILE" >&2
+  echo "Set UI_REPO to the sibling UI checkout at merged SHA $EXPECTED_UI_SHA." >&2
+  exit 1
+fi
+
 # 1. Every file in the FULL chain must be present (a missing hardening/grant
 #    migration means the schema could only be loaded through PR#4 — reject it).
 for f in "$BASELINE" "$MIG_DRAFT" "$MIG_PHASE2" "$MIG_FOUNDATION" "$MIG_HARDENING" "$MIG_GRANT"; do
@@ -99,21 +121,27 @@ if git -C "$UI_REPO" rev-parse --git-dir >/dev/null 2>&1; then
   fi
 fi
 
-# 3. All THREE Phase 3 checksums must match exactly (foundation, hardening, grant).
+# 3. All THREE Phase 3 checksums must match the UI manifest exactly. The expected
+#    values are read FROM the manifest (single source), never hand-copied here.
 verify_sha() {
-  local label="$1" file="$2" expected="$3" actual
+  local label="$1" file="$2" expected actual
+  expected="$(manifest_sha "$(basename "$file")")"
+  if [ -z "$expected" ]; then
+    echo "ERROR: $label migration not listed in the UI manifest." >&2
+    exit 1
+  fi
   actual="$(sha256sum "$file" | awk '{print $1}')"
   if [ "$actual" != "$expected" ]; then
-    echo "ERROR: $label migration checksum mismatch." >&2
+    echo "ERROR: $label migration checksum mismatch (vs UI manifest)." >&2
     echo "  expected $expected" >&2
     echo "  actual   $actual" >&2
     exit 1
   fi
 }
-verify_sha "foundation (20260713100000)" "$MIG_FOUNDATION" "$EXPECTED_FOUNDATION_SHA"
-verify_sha "hardening  (20260714100000)" "$MIG_HARDENING" "$EXPECTED_HARDENING_SHA"
-verify_sha "grant      (20260715100000)" "$MIG_GRANT" "$EXPECTED_GRANT_SHA"
-echo "Canonical pin verified: UI $EXPECTED_UI_SHA, all 3 Phase 3 checksums OK."
+verify_sha "foundation (20260713100000)" "$MIG_FOUNDATION"
+verify_sha "hardening  (20260714100000)" "$MIG_HARDENING"
+verify_sha "grant      (20260715100000)" "$MIG_GRANT"
+echo "Canonical pin verified: UI $EXPECTED_UI_SHA, 3 Phase 3 checksums OK (from manifest)."
 
 if check_running; then
   echo "Reusing PostgreSQL already running on port $PORT."
@@ -136,7 +164,7 @@ apply() {
   echo "  applying $(basename "$2")"
   psql "${PSQL_ARGS[@]}" -d "$DB_NAME" -v ON_ERROR_STOP=1 -q -f "$2" >/dev/null
 }
-echo "Loading canonical schema (baseline + FULL 5-migration chain @ UI 422485a)..."
+echo "Loading canonical schema (baseline + FULL 5-migration chain @ UI $EXPECTED_UI_SHA)..."
 apply baseline "$BASELINE"
 apply draft "$MIG_DRAFT"
 apply phase2 "$MIG_PHASE2"

@@ -18,14 +18,13 @@ concurrency:
 env:
   NODE_VERSION: "22.22.2"
   PNPM_VERSION: "10.33.0"
-  # The canonical schema is owned by the sibling UI repo at this merged SHA
-  # (Workstream A: baseline + 5 migrations). Full 40-char SHA: actions/checkout
-  # cannot fetch an abbreviated ref.
-  UI_REPO_REF: "422485af44fa4606a7c0dbee798a9866b3fd0d8e"
-  # All THREE Phase 3 migration checksums are pinned and verified fail-closed.
-  EXPECTED_FOUNDATION_SHA: "a2319ada8d471d09063b8e2bfbdb8c814e4ba49cecdee08c9bbd9b800aa8c72a"
-  EXPECTED_HARDENING_SHA: "ee064f0b50d01897b8247a10edefc95bd0088862e3731693b19da7c851253977"
-  EXPECTED_GRANT_SHA: "ca15b9de01894ef784fad57f991a052e2da1fcdca435cc1a78463af34b3c0dba"
+  # actions/checkout needs a literal ref BEFORE any file is readable, so the UI
+  # commit SHA appears here as a literal. It MUST equal
+  # config/canonical-transport-contract.lock.json -> uiCommitSha; `pnpm
+  # contract:verify` asserts `git -C ui-schema rev-parse HEAD === lock.uiCommitSha`
+  # and verifies every migration checksum against the checked-out manifest, so
+  # there are no hand-copied checksum env vars any more (single source of truth).
+  UI_REPO_REF: "44c62c630b1db6bbdbcf5c95863bd3b896a77c99"
 
 jobs:
   build-and-test:
@@ -85,27 +84,14 @@ jobs:
       - name: License policy check (no AGPL / non-permissive)
         run: pnpm run license:check
 
-      - name: Verify canonical UI SHA + all three Phase 3 checksums (fail closed)
-        run: |
-          set -euo pipefail
-          # The checked-out UI schema MUST be the pinned canonical SHA.
-          actual_sha="$(git -C ui-schema rev-parse HEAD)"
-          if [ "$actual_sha" != "$UI_REPO_REF" ]; then
-            echo "UI schema SHA mismatch: $actual_sha != $UI_REPO_REF"; exit 1
-          fi
-          verify() {
-            local file="$1" expected="$2"
-            if [ ! -f "$file" ]; then echo "MISSING migration: $file"; exit 1; fi
-            local a; a="$(sha256sum "$file" | awk '{print $1}')"
-            if [ "$a" != "$expected" ]; then
-              echo "Checksum mismatch for $file: $a != $expected"; exit 1
-            fi
-          }
-          M=ui-schema/supabase/migrations
-          verify "$M/20260713100000_transport_foundation.sql"        "$EXPECTED_FOUNDATION_SHA"
-          verify "$M/20260714100000_transport_contract_hardening.sql" "$EXPECTED_HARDENING_SHA"
-          verify "$M/20260715100000_worker_transition_grant.sql"      "$EXPECTED_GRANT_SHA"
-          echo "Canonical pin verified: UI $UI_REPO_REF + 3 Phase 3 checksums."
+      - name: Verify canonical transport contract (single fail-closed gate)
+        # ONE implementation, used identically locally and in CI. Reads the
+        # backend lock + the checked-out UI manifest; asserts the UI SHA, the
+        # manifest hash + versions, every migration checksum, the worker
+        # privilege/queue/flag boundaries, and the static regression scans.
+        env:
+          UI_REPO: ui-schema
+        run: pnpm contract:verify
 
       - name: Start local Postgres + load canonical schema
         run: UI_REPO="$GITHUB_WORKSPACE/ui-schema" bash scripts/test-db.sh --print

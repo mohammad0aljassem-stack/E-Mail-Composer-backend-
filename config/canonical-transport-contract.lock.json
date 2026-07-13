@@ -1,0 +1,7 @@
+{
+  "uiCommitSha": "44c62c630b1db6bbdbcf5c95863bd3b896a77c99",
+  "manifestPath": "supabase/contracts/phase3-transport-contract.json",
+  "manifestSha256": "e454ea376e6cac0a17deb677499f67857f46315328f5ca5a6e09a0da997ec6e7",
+  "supportedManifestSchemaVersion": 1,
+  "supportedTransportContractVersion": 1
+}

@@ -3,9 +3,9 @@ import type { SendState } from "./send-state.js";
 /**
  * Domain model types shared across db, providers, queues and workers. These
  * mirror the canonical transport schema columns (see the UI repo migration
- * 20260713100000_transport_foundation.sql, sha256
- * a2319ada8d471d09063b8e2bfbdb8c814e4ba49cecdee08c9bbd9b800aa8c72a) but are
- * expressed as explicit TypeScript contracts — never a broad Record.
+ * 20260713100000_transport_foundation.sql, whose checksum is pinned via the UI
+ * manifest and the backend lock — not duplicated here) but are expressed as
+ * explicit TypeScript contracts — never a broad Record.
  */
 
 export type FolderRole =

@@ -3,13 +3,20 @@
 A production-quality, **fully locally-testable** foundation for the IMAP/SMTP
 transport worker. This repository owns the **backend worker**; the canonical
 database schema and all deployable migrations are owned by the sibling UI repo
-(`E-Mail-Composer-UI`, merged commit `422485af44fa4606a7c0dbee798a9866b3fd0d8e`).
-The three Phase 3 migrations are checksum-pinned and verified fail-closed in CI
-and `scripts/test-db.sh`: transport foundation
-`a2319ada8d471d09063b8e2bfbdb8c814e4ba49cecdee08c9bbd9b800aa8c72a`, contract
-hardening `ee064f0b50d01897b8247a10edefc95bd0088862e3731693b19da7c851253977`,
-worker-transition grant
-`ca15b9de01894ef784fad57f991a052e2da1fcdca435cc1a78463af34b3c0dba`.
+(`E-Mail-Composer-UI`, merged commit `44c62c630b1db6bbdbcf5c95863bd3b896a77c99`).
+
+The backend is pinned to that contract by a **single source of truth**:
+[`config/canonical-transport-contract.lock.json`](config/canonical-transport-contract.lock.json)
+records the UI commit SHA, the manifest path, the manifest `sha256`, and the
+supported schema/contract versions. The migration checksums themselves live in
+the UI's machine-readable manifest
+(`supabase/contracts/phase3-transport-contract.json`) — never hand-copied here.
+A single fail-closed command, **`pnpm contract:verify`**, is used identically
+locally and in CI: it asserts the checked-out UI SHA equals the lock, the
+manifest hash + versions match, every listed migration's on-disk checksum
+matches the manifest, and the worker privilege / queue / feature-flag boundaries
+and static regression scans hold. See
+[docs/adr/0007-canonical-contract-lock.md](docs/adr/0007-canonical-contract-lock.md).
 
 > **Production remains DISABLED.** `MAIL_TRANSPORT_V1_ENABLED` defaults `false`.
 > With the flag off the worker starts NO IMAP/SMTP connection, runs NO send
@@ -70,6 +77,11 @@ pnpm test            # unit tests
 pnpm test:coverage   # unit tests + coverage thresholds
 pnpm build           # emit dist/
 
+# Canonical-contract compatibility gate (single fail-closed command).
+# Point UI_REPO at the sibling UI checkout pinned to the lock's uiCommitSha
+# (defaults to ./ui-schema, then /home/user/E-Mail-Composer-UI).
+UI_REPO=/home/user/E-Mail-Composer-UI pnpm contract:verify
+
 # Integration (real local Postgres + pg-boss + fakes)
 bash scripts/test-db.sh --print      # start throwaway PG16, load canonical schema
 export TEST_DATABASE_URL=postgresql://postgres@localhost:54330/transport_test
@@ -112,18 +124,19 @@ tests run under the real least-privilege role with nothing added.
 
 ## Documentation
 
-| Doc                                                                              | Purpose                             |
-| -------------------------------------------------------------------------------- | ----------------------------------- |
-| [docs/env-reference.md](docs/env-reference.md)                                   | Every environment variable          |
-| [docs/runbook.md](docs/runbook.md)                                               | Operating the worker + provisioning |
-| [docs/adr/0001-mail-provider.md](docs/adr/0001-mail-provider.md)                 | MailProvider contract               |
-| [docs/adr/0002-queues.md](docs/adr/0002-queues.md)                               | pg-boss families + policies         |
-| [docs/adr/0003-safe-send.md](docs/adr/0003-safe-send.md)                         | Safe-send state machine             |
-| [docs/adr/0004-credential-encryption.md](docs/adr/0004-credential-encryption.md) | Credential cipher                   |
-| [docs/adr/0005-imap-sync.md](docs/adr/0005-imap-sync.md)                         | IMAP sync + UIDVALIDITY             |
-| [docs/adr/0006-durable-sync-requests.md](docs/adr/0006-durable-sync-requests.md) | Durable claimable sync requests     |
-| [docs/testing-and-failure-injection.md](docs/testing-and-failure-injection.md)   | Test map + fakes                    |
-| [docs/security-review.md](docs/security-review.md)                               | Phase 3A security review            |
-| [docs/phase-3b-checklist.md](docs/phase-3b-checklist.md)                         | Controlled-IONOS rollout            |
-| [docs/production-non-deployment.md](docs/production-non-deployment.md)           | Why prod stays off                  |
-| [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)                                 | Dependency licenses                 |
+| Doc                                                                                  | Purpose                                     |
+| ------------------------------------------------------------------------------------ | ------------------------------------------- |
+| [docs/env-reference.md](docs/env-reference.md)                                       | Every environment variable                  |
+| [docs/runbook.md](docs/runbook.md)                                                   | Operating the worker + provisioning         |
+| [docs/adr/0001-mail-provider.md](docs/adr/0001-mail-provider.md)                     | MailProvider contract                       |
+| [docs/adr/0002-queues.md](docs/adr/0002-queues.md)                                   | pg-boss families + policies                 |
+| [docs/adr/0003-safe-send.md](docs/adr/0003-safe-send.md)                             | Safe-send state machine                     |
+| [docs/adr/0004-credential-encryption.md](docs/adr/0004-credential-encryption.md)     | Credential cipher                           |
+| [docs/adr/0005-imap-sync.md](docs/adr/0005-imap-sync.md)                             | IMAP sync + UIDVALIDITY                     |
+| [docs/adr/0006-durable-sync-requests.md](docs/adr/0006-durable-sync-requests.md)     | Durable claimable sync requests             |
+| [docs/adr/0007-canonical-contract-lock.md](docs/adr/0007-canonical-contract-lock.md) | Canonical contract lock + `contract:verify` |
+| [docs/testing-and-failure-injection.md](docs/testing-and-failure-injection.md)       | Test map + fakes                            |
+| [docs/security-review.md](docs/security-review.md)                                   | Phase 3A security review                    |
+| [docs/phase-3b-checklist.md](docs/phase-3b-checklist.md)                             | Controlled-IONOS rollout                    |
+| [docs/production-non-deployment.md](docs/production-non-deployment.md)               | Why prod stays off                          |
+| [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)                                     | Dependency licenses                         |
