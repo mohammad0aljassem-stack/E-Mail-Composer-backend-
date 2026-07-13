@@ -185,3 +185,31 @@ describe("strict boolean env parsing (C5)", () => {
     ).toBe(false);
   });
 });
+
+describe("SYNC_MAX_BATCHES_PER_JOB (durable multi-batch loop bound)", () => {
+  const base = { DATABASE_URL: "postgres://localhost/db" };
+
+  it("defaults to 10", () => {
+    expect(loadConfig(base).syncMaxBatchesPerJob).toBe(10);
+    expect(
+      loadConfig({ ...base, SYNC_MAX_BATCHES_PER_JOB: "" })
+        .syncMaxBatchesPerJob,
+    ).toBe(10);
+  });
+
+  it("accepts a positive integer", () => {
+    expect(
+      loadConfig({ ...base, SYNC_MAX_BATCHES_PER_JOB: "1" })
+        .syncMaxBatchesPerJob,
+    ).toBe(1);
+  });
+
+  it.each(["0", "-1", "2.5", "ten", "1e2x"])(
+    "rejects %j via the strict int parser (must be >= 1)",
+    (value) => {
+      expect(() =>
+        loadConfig({ ...base, SYNC_MAX_BATCHES_PER_JOB: value }),
+      ).toThrow(TransportError);
+    },
+  );
+});

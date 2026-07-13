@@ -39,7 +39,8 @@ import type {
 import { plannedRegistrations } from "./registration-plan.js";
 import { ImapSmtpProviderFactory } from "../workers/provider-factory.js";
 import { SendExecutor } from "../workers/send-executor.js";
-import { SyncExecutor, enqueueSyncFollowUp } from "../workers/sync-executor.js";
+import { SyncExecutor } from "../workers/sync-executor.js";
+import { runSyncJob } from "../workers/sync-lifecycle.js";
 import { SyncRequestDispatcher } from "../workers/sync-request-dispatcher.js";
 import { MutationExecutor } from "../workers/mutation-executor.js";
 import type { Job, JobWithMetadata } from "pg-boss";
@@ -123,6 +124,7 @@ async function main(): Promise<void> {
     const workerClaims = new WorkerClaimRepository(db);
 
     if (plan.syncMailbox) {
+      const syncRequests = new SyncRequestRepository(db);
       const syncExec = new SyncExecutor({
         mailboxes: new MailboxRepository(db),
         folders: new FolderRepository(db),
@@ -142,7 +144,7 @@ async function main(): Promise<void> {
       // Runs only because master + sync capability are on (this whole branch
       // is flag-gated).
       const dispatcher = new SyncRequestDispatcher({
-        syncRequests: new SyncRequestRepository(db),
+        syncRequests,
         mailboxes: new MailboxRepository(db),
         sendClaims: workerClaims,
         enqueueSync: (job) => queues.enqueueSyncForRequest(job),
@@ -159,38 +161,36 @@ async function main(): Promise<void> {
       const syncRetryLimit =
         QUEUE_DEFINITIONS[QUEUE_NAMES.syncMailbox].retryLimit ?? 0;
 
+      // Durable multi-batch lifecycle (bounded in-job loop + fenced lease
+      // renewal + cursor-keyed continuation): see runSyncJob and the state
+      // diagram in ../workers/sync-request-dispatcher.ts. The handler stays
+      // thin registration — completion/failure semantics live in runSyncJob.
       await queues.instance.work(
         QUEUE_NAMES.syncMailbox,
         { includeMetadata: true },
         async (jobs: JobWithMetadata<SyncMailboxJob>[]) => {
           for (const job of jobs) {
-            const requestId = job.data.syncRequestId;
-            try {
-              const result = await syncExec.execute(job.data);
-              // Mark the durable request completed ONLY after the sync completed.
-              if (requestId !== undefined) {
-                await dispatcher.markCompleted(requestId);
-              }
-              // Multi-batch backlog: enqueue ONE incremental follow-up sync for
-              // the same mailbox+folder (deduped by the mailbox+folder
-              // singletonKey, workspace group preserved).
-              await enqueueSyncFollowUp({
-                result,
-                job: job.data,
-                enqueueSync: (followUp) => queues.enqueueSync(followUp),
+            await runSyncJob(
+              {
+                executor: syncExec,
+                syncRequests,
+                enqueueContinuation: (continuation) =>
+                  queues.enqueueSyncContinuation({
+                    workspaceId: continuation.workspaceId,
+                    mailboxId: continuation.mailboxId,
+                    folder: continuation.folder,
+                    mode: continuation.mode,
+                    syncRequestId: continuation.syncRequestId,
+                    cursorUid: continuation.cursorUid,
+                  }),
+                enqueueFollowUp: (followUp) => queues.enqueueSync(followUp),
+                clock,
                 logger,
-              });
-            } catch (err) {
-              // Terminal-fail the durable request on the FINAL pg-boss attempt so
-              // durable re-claims and pg-boss retries never multiply. Content-free
-              // code only. Re-throw so pg-boss records the job failure too.
-              if (requestId !== undefined && job.retryCount >= syncRetryLimit) {
-                await dispatcher
-                  .markFailed(requestId, "sync_failed")
-                  .catch(() => undefined);
-              }
-              throw err;
-            }
+                config: { maxBatchesPerJob: config.syncMaxBatchesPerJob },
+              },
+              job.data,
+              { finalAttempt: job.retryCount >= syncRetryLimit },
+            );
           }
         },
       );

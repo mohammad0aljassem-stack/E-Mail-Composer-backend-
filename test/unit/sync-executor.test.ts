@@ -83,6 +83,8 @@ describe("SyncExecutor", () => {
     h.server.seedMessage("INBOX", { messageId: "<m2@x>", subject: "B" });
     const res = await h.exec.execute(initialJob);
     expect(res.persisted).toBe(2);
+    // The result reports the cursor position it just persisted (max UID).
+    expect(res.lastSeenUid).toBe(2n);
     const inbox = await h.folders.getByMailboxAndName(MAILBOX_ID, "INBOX");
     expect(await h.messages.countByFolder(inbox!.id)).toBe(2);
   });
@@ -143,6 +145,7 @@ describe("SyncExecutor", () => {
     expect(res.uidValidityChanged).toBe(true);
     expect(res.needsFollowUp).toBe(true);
     expect(res.persisted).toBe(0); // nothing mixed into the old namespace
+    expect(res.lastSeenUid).toBe(0n); // invalidated cursor is reported as 0n
 
     const inbox = await h.folders.getByMailboxAndName(MAILBOX_ID, "INBOX");
     expect(inbox?.uidvalidity).toBe(20n);
@@ -170,6 +173,7 @@ describe("SyncExecutor", () => {
       persisted: 0,
       uidValidityChanged: false,
       needsFollowUp: false,
+      lastSeenUid: 0n,
     });
     expect(h.factory.imapSessionsCreated).toBe(0); // no provider, no IMAP connect
     expect(h.factory.submissionsCreated).toBe(0);
@@ -221,11 +225,15 @@ describe("SyncExecutor", () => {
     const res = await h.exec.execute(incrementalJob);
     expect(res.persisted).toBe(2);
     expect(res.needsFollowUp).toBe(true);
+    // SyncResult.lastSeenUid === the persisted cursor after THIS batch — the
+    // value multi-batch continuation keys are derived from.
+    expect(res.lastSeenUid).toBe(2n);
     const inbox = await h.folders.getByMailboxAndName(MAILBOX_ID, "INBOX");
     expect(inbox?.lastSeenUid).toBe(2n);
     // The follow-up picks up the remainder.
     const res2 = await h.exec.execute(incrementalJob);
     expect(res2.persisted).toBe(1);
+    expect(res2.lastSeenUid).toBe(3n);
     expect(
       (await h.folders.getByMailboxAndName(MAILBOX_ID, "INBOX"))?.lastSeenUid,
     ).toBe(3n);
@@ -246,6 +254,7 @@ describe("enqueueSyncFollowUp (sync_mailbox handler)", () => {
     persisted: 0,
     uidValidityChanged: false,
     needsFollowUp,
+    lastSeenUid: 0n,
   });
 
   it("enqueues exactly one incremental follow-up when needsFollowUp is true", async () => {

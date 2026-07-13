@@ -92,6 +92,32 @@ export class QueueManager {
     );
   }
 
+  /**
+   * Enqueue the CONTINUATION of a durable multi-batch sync request: the in-job
+   * batch loop hit its bound while the executor still reports needsFollowUp.
+   * The job payload carries the SAME syncRequestId (every continuation stays
+   * associated with the original durable request); the singletonKey is
+   * deterministic in (request id, cursor position) so it can never collide with
+   * the original `sync-req:{id}` dispatch key, and a crash-recovery duplicate
+   * of the same continuation dedups to null (see singletonKeys).
+   */
+  public async enqueueSyncContinuation(
+    job: SyncMailboxJob & { syncRequestId: string; cursorUid: string },
+  ): Promise<string | null> {
+    const { cursorUid, ...payload } = job;
+    return this.boss.send(
+      QUEUE_NAMES.syncMailbox,
+      { ...payload },
+      {
+        singletonKey: singletonKeys.syncRequestContinuation(
+          job.syncRequestId,
+          cursorUid,
+        ),
+        group: { id: job.workspaceId },
+      },
+    );
+  }
+
   public async enqueueDraftMirror(job: DraftMirrorJob): Promise<string | null> {
     return this.boss.send(
       QUEUE_NAMES.draftMirror,

@@ -51,6 +51,12 @@ export interface TransportConfig {
   readonly syncClaimBatchSize: number;
   /** Durable sync_requests: hard cap on durable re-claims before failed. */
   readonly syncMaxAttempts: number;
+  /**
+   * Max executor batches run inside ONE sync_mailbox job before the handler
+   * enqueues a cursor-keyed continuation job (bounds job runtime so the pg-boss
+   * expiration + the durable lease renewal cadence stay honest).
+   */
+  readonly syncMaxBatchesPerJob: number;
 }
 
 /**
@@ -259,5 +265,10 @@ export function loadConfig(
       "SYNC_CLAIM_BATCH_SIZE",
     ),
     syncMaxAttempts: int(env.SYNC_MAX_ATTEMPTS, 5, "SYNC_MAX_ATTEMPTS"),
+    syncMaxBatchesPerJob: int(
+      env.SYNC_MAX_BATCHES_PER_JOB,
+      10,
+      "SYNC_MAX_BATCHES_PER_JOB",
+    ),
   };
 }

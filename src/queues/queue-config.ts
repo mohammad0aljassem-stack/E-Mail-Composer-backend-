@@ -117,6 +117,18 @@ export const singletonKeys = {
    * the canonical uq_sync_requests_open dedup) map to distinct keys.
    */
   syncRequest: (syncRequestId: string): string => `sync-req:${syncRequestId}`,
+  /**
+   * Multi-batch continuation key for a durable request: DETERMINISTIC in the
+   * request id AND the folder-cursor position (lastSeenUid) after the last
+   * completed batch. Distinct from the original `sync-req:{id}` key by
+   * construction, so a continuation can never be swallowed by the singleton
+   * dedup of the currently running/queued dispatch job; and a crash-recovery
+   * duplicate of the SAME continuation (same request, same cursor) produces the
+   * SAME key, so pg-boss dedups it (boss.send returns null → proven-equivalent
+   * work already queued).
+   */
+  syncRequestContinuation: (syncRequestId: string, cursorUid: string): string =>
+    `sync-req:${syncRequestId}:uid:${cursorUid}`,
   draftMirror: (draftId: string, revision: string): string =>
     `draft:${draftId}:${revision}`,
   sendMessage: (sendIntentId: string): string => `send:${sendIntentId}`,

@@ -233,6 +233,46 @@ describe("C1 — SMTP capability is confined to the submission factory path", ()
   });
 });
 
+describe("Correction 3 — durable multi-batch sync lifecycle invariants", () => {
+  // The false-completion defect: the worker entrypoint used to markCompleted
+  // after the FIRST executor batch. Completion now lives ONLY in the extracted
+  // lifecycle function, which must check needsFollowUp before completing.
+  it("the worker entrypoint never calls markCompleted (lifecycle owns completion)", () => {
+    const code = codeLines(read("src/entrypoints/worker.ts")).join("\n");
+    expect(code.includes("markCompleted")).toBe(false);
+  });
+
+  it("the lifecycle module references needsFollowUp before calling markCompleted", () => {
+    const code = codeLines(read("src/workers/sync-lifecycle.ts")).join("\n");
+    const followUpAt = code.indexOf("needsFollowUp");
+    // The CALL site (`.markCompleted(`) — not the store-interface Pick type.
+    const completedAt = code.indexOf("markCompleted(");
+    expect(followUpAt).toBeGreaterThanOrEqual(0);
+    expect(completedAt).toBeGreaterThanOrEqual(0);
+    expect(followUpAt).toBeLessThan(completedAt);
+  });
+
+  // A continuation must NEVER drop the durable request id (the original defect
+  // enqueued follow-ups via the plain mailbox+folder key, losing the request).
+  it("every continuation enqueue call site passes syncRequestId", () => {
+    const callish = /enqueueSyncContinuation\s*\(|\benqueueContinuation\s*\(/;
+    for (const rel of walk("src", [".ts"])) {
+      // The QueueManager method definition itself derives the key; call sites
+      // elsewhere must pass the id inside the argument object.
+      if (rel === "src/queues/queue-manager.ts") continue;
+      const lines = codeLines(read(rel));
+      for (let i = 0; i < lines.length; i++) {
+        if (!callish.test(lines[i]!)) continue;
+        const window = lines.slice(i, i + 10).join("\n");
+        expect(
+          window.includes("syncRequestId"),
+          `continuation enqueue without syncRequestId in ${rel} near: ${lines[i]!.trim()}`,
+        ).toBe(true);
+      }
+    }
+  });
+});
+
 describe("B7 — send_message acquires no retry behavior", () => {
   it("the send_message queue block keeps retryLimit 0 / retryBackoff false", () => {
     const src = read("src/queues/queue-config.ts");

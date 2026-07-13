@@ -649,6 +649,29 @@ export class SyncRequestRepository implements SyncRequestStore {
     return r.rows.map((row) => this.map(row));
   }
 
+  /**
+   * Fenced lease renewal (single atomic CAS on claimed_at). Succeeds ONLY when
+   * the row is still `claimed` AND claimed_at equals the exact token the caller
+   * holds; a lost CAS (another claimant re-claimed, or the request went
+   * terminal) returns null and the caller must stop without marking anything.
+   * attempt_count is deliberately NOT touched: renewals are not re-claims.
+   */
+  public async renewLease(
+    id: string,
+    prevClaimedAt: Date,
+    now: Date,
+  ): Promise<Date | null> {
+    const r = await this.db.query(
+      `update transport.sync_requests
+          set claimed_at = $3
+        where id = $1 and status = 'claimed' and claimed_at = $2
+      returning claimed_at`,
+      [id, prevClaimedAt, now],
+    );
+    const row = r.rows[0];
+    return row === undefined ? null : date(row.claimed_at);
+  }
+
   public async markCompleted(
     id: string,
     now: Date,

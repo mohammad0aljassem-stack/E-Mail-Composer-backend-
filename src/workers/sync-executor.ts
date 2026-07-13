@@ -55,6 +55,13 @@ export interface SyncResult {
   readonly uidValidityChanged: boolean;
   /** True when the caller should enqueue a follow-up incremental sync. */
   readonly needsFollowUp: boolean;
+  /**
+   * The folder cursor's lastSeenUid AFTER this batch — the exact value the
+   * executor persisted via updateCursor (the max persisted UID). 0n when no
+   * cursor exists / it was invalidated (kill-switch skip, UIDVALIDITY reset).
+   * The caller keys multi-batch continuations on it (cursor-distinct dedup).
+   */
+  readonly lastSeenUid: bigint;
 }
 
 export class SyncExecutor {
@@ -71,7 +78,12 @@ export class SyncExecutor {
     // Global kill switch: skip content-free BEFORE any provider/IMAP contact.
     if (this.deps.config.globalKillSwitch) {
       log.warn("sync_skipped_global_kill_switch");
-      return { persisted: 0, uidValidityChanged: false, needsFollowUp: false };
+      return {
+        persisted: 0,
+        uidValidityChanged: false,
+        needsFollowUp: false,
+        lastSeenUid: 0n,
+      };
     }
 
     const mailbox = await this.requireSyncableMailbox(job.mailboxId);
@@ -131,7 +143,12 @@ export class SyncExecutor {
           detail: { folder: job.folder },
         });
         log.warn("uidvalidity_changed");
-        return { persisted: 0, uidValidityChanged: true, needsFollowUp: true };
+        return {
+          persisted: 0,
+          uidValidityChanged: true,
+          needsFollowUp: true,
+          lastSeenUid: 0n, // cursor invalidated — resync restarts the namespace
+        };
       }
 
       // Persist messages FIRST (durable), THEN advance the cursor.
@@ -174,6 +191,8 @@ export class SyncExecutor {
         persisted: result.messages.length,
         uidValidityChanged: false,
         needsFollowUp,
+        // The same value updateCursor just persisted (cursor advancement).
+        lastSeenUid: result.cursor.lastSeenUid,
       };
     } finally {
       await provider.disconnect().catch(() => undefined);

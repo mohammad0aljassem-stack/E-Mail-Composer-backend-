@@ -47,6 +47,9 @@
 //       has no dependency on worker sub-capabilities, so the backend env
 //       parser is the single source of truth for these runtime controls and
 //       the fail-closed default is enforced HERE.
+//   15b durable multi-batch lifecycle: SyncRequestRepository.renewLease
+//       exists and is a fenced CAS (status = 'claimed' AND claimed_at =
+//       <held token>) so at most one claimant is ever effective.
 //   16  read-only executor modules (sync / mutation / draft-mirror /
 //       sync-request dispatcher) neither import nor construct the SMTP
 //       client (NodemailerSmtpClient) — a read-only sync can never carry
@@ -392,6 +395,27 @@ for (const hit of scanAuditPolling()) {
       "[15] the durable sync-request claim SQL must use FOR UPDATE SKIP LOCKED.",
     );
   }
+
+  // 15b (Phase 3B): fenced lease renewal for multi-batch claims — renewLease
+  // must exist and its SQL must be a claimed_at CAS guarded on status='claimed'
+  // (single-claimant guarantee without any schema change).
+  const renew = /async\s+renewLease\s*\([\s\S]{0,900}?returning/i.exec(repos);
+  if (renew === null) {
+    fail(
+      "[15b] SyncRequestRepository.renewLease is missing from repositories.",
+    );
+  } else {
+    if (!/status\s*=\s*'claimed'/i.test(renew[0])) {
+      fail(
+        "[15b] renewLease SQL must be guarded on status = 'claimed' (CAS shape).",
+      );
+    }
+    if (!/where[\s\S]*?claimed_at\s*=\s*\$\d/i.test(renew[0])) {
+      fail(
+        "[15b] renewLease SQL must CAS on claimed_at = <held token> in its WHERE clause.",
+      );
+    }
+  }
 }
 
 // --- 16. read-only executor modules never import/construct the SMTP client -
@@ -569,9 +593,9 @@ function report() {
       `  manifest: ${lock.manifestPath} (sha256 ${lock.manifestSha256})\n` +
       `  versions: manifestSchema=${lock.supportedManifestSchemaVersion}, ` +
       `transportContract=${lock.supportedTransportContractVersion}\n` +
-      "  checks 1–16 (incl. 12b) passed (SHA, manifest hash, versions, migration " +
+      "  checks 1–16 (incl. 12b, 15b) passed (SHA, manifest hash, versions, migration " +
       "checksums, privilege/queue/flag boundaries, capability-flag defaults, " +
-      "static regression scans).",
+      "sync lease CAS, static regression scans).",
   );
   process.exit(0);
 }

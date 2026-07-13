@@ -400,6 +400,29 @@ export class FakeSyncRequestRepo implements SyncRequestStore {
     return Promise.resolve(claimed);
   }
 
+  /**
+   * Fenced lease renewal — same CAS semantics as the SQL implementation:
+   * succeeds only while status='claimed' AND claimed_at equals the exact token
+   * the caller holds; never touches attempt_count.
+   */
+  public renewLease(
+    id: string,
+    prevClaimedAt: Date,
+    now: Date,
+  ): Promise<Date | null> {
+    const r = this.rows.get(id);
+    if (
+      r === undefined ||
+      r.status !== "claimed" ||
+      r.claimedAt === null ||
+      r.claimedAt.getTime() !== prevClaimedAt.getTime()
+    ) {
+      return Promise.resolve(null);
+    }
+    this.rows.set(id, { ...r, claimedAt: now });
+    return Promise.resolve(now);
+  }
+
   public markCompleted(id: string, now: Date): Promise<SyncRequestRow | null> {
     const r = this.rows.get(id);
     if (r === undefined || r.status !== "claimed") return Promise.resolve(null);
