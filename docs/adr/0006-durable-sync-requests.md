@@ -5,8 +5,9 @@
 ## Context
 
 `request_mailbox_sync` used to be a fire-and-forget audit stub. The canonical
-contract-hardening migration (`20260714100000`, UI `422485a`) turns it into a
-durable, claimable work item: a `SECURITY DEFINER` RPC INSERTs a row into the
+contract-hardening migration (`20260714100000`, pinned via the UI manifest +
+`config/canonical-transport-contract.lock.json`) turns it into a durable,
+claimable work item: a `SECURITY DEFINER` RPC INSERTs a row into the
 PRIVATE `transport.sync_requests` table (deduped per mailbox(+folder) while an
 open `pending|claimed` request exists). The worker must **consume** those rows
 without ever polling `transport_audit` (which is not a queue) and without

@@ -23,6 +23,20 @@ The worker validates configuration at startup via `src/config/env.ts` and
 | `SYNC_MAX_ATTEMPTS`                               | `5`            | no             | Hard cap on durable re-claims before a stale sync-request is failed.                                                      |
 | `PROVISION_WORKSPACE_ID` / `PROVISION_MAILBOX_ID` | —              | CLI only       | Used by the test-only provisioning CLI.                                                                                   |
 
+## Tooling-only variables (never read by the worker runtime)
+
+| Variable                   | Default                                             | Used by                                      | Meaning                                                                                                    |
+| -------------------------- | --------------------------------------------------- | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `UI_REPO`                  | `./ui-schema`, then `/home/user/E-Mail-Composer-UI` | `pnpm contract:verify`, `scripts/test-db.sh` | Path to the sibling UI checkout pinned to `config/canonical-transport-contract.lock.json` → `uiCommitSha`. |
+| `TEST_DATABASE_URL`        | —                                                   | integration tests                            | Superuser URL for the throwaway local Postgres (seeding + pg-boss).                                        |
+| `TEST_WORKER_DATABASE_URL` | —                                                   | integration tests                            | Least-privileged `transport_worker` login URL for the privilege-proof tests.                               |
+
+`pnpm contract:verify` is the single fail-closed compatibility gate between this
+backend and the canonical transport contract (see
+[docs/adr/0007-canonical-contract-lock.md](adr/0007-canonical-contract-lock.md)).
+It reads the pin from the backend lock and the migration checksums from the UI
+manifest — no value here is a secret and none is ever logged.
+
 ## Fail-closed rules
 
 - Missing `DATABASE_URL` → refuse to start.
