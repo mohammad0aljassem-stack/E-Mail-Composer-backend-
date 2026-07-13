@@ -23,9 +23,10 @@ import type {
   WorkerClaimStore,
 } from "../db/repository-interfaces.js";
 import type {
-  MailProvider,
+  ImapSessionProvider,
   OutboundMessage,
   SendResult,
+  SubmissionProvider,
 } from "../providers/mail-provider.js";
 import type {
   ProviderFactory,
@@ -263,18 +264,24 @@ export class SendExecutor {
         ...payload.message,
         messageId: intent.messageId,
       };
-      const provider = await this.deps.providerFactory.create(mailbox);
+      // (C1) Capability-scoped construction: the SMTP submission channel is
+      // built ONLY here — strictly AFTER the integrity verification (4) and
+      // the sender-authority guard (4b) above. No other code path may call
+      // createSubmission.
+      const submission =
+        await this.deps.providerFactory.createSubmission(mailbox);
       try {
         return await this.deliver(
           intent,
           cur.id,
           cur.version,
-          provider,
+          mailbox,
+          submission,
           outbound,
           log,
         );
       } finally {
-        await provider.disconnect().catch(() => undefined);
+        await submission.close().catch(() => undefined);
       }
     } finally {
       await this.deps.claims.release(cur.id).catch(() => undefined);
@@ -285,7 +292,8 @@ export class SendExecutor {
     intent: SendIntentRow,
     attemptId: string,
     versionAtClaimed: bigint,
-    provider: MailProvider,
+    mailbox: MailboxRow,
+    submission: SubmissionProvider,
     outbound: OutboundMessage,
     log: Logger,
   ): Promise<SendOutcome> {
@@ -310,7 +318,7 @@ export class SendExecutor {
 
     let sendResult: SendResult;
     try {
-      sendResult = await provider.sendMessage(outbound); // OUTSIDE any txn
+      sendResult = await submission.sendMessage(outbound); // OUTSIDE any txn
     } catch (err) {
       if (err instanceof SmtpPreDataError) {
         await this.deps.attempts.compareAndSet({
@@ -405,7 +413,7 @@ export class SendExecutor {
       attemptId,
       accepted.version,
       "smtp_accepted",
-      provider,
+      mailbox,
       outbound,
       log,
     );
@@ -416,23 +424,27 @@ export class SendExecutor {
     attemptId: string,
     version: bigint,
     fromState: "smtp_accepted" | "sent_copy_pending",
-    provider: MailProvider,
+    mailbox: MailboxRow,
     outbound: OutboundMessage,
     log: Logger,
   ): Promise<SendOutcome> {
+    // Sent-copy work is IMAP-ONLY: an IMAP session is created here and NEVER a
+    // submission — after acceptance the message must never be re-submitted.
+    let session: ImapSessionProvider | null = null;
     try {
+      session = await this.deps.providerFactory.createImapSession(mailbox);
       // Resolve the DISCOVERED sent-role folder for this mailbox (IONOS
       // localizes it, e.g. "Gesendete Objekte"); fall back to the configured
       // default when discovery has no sent-role row. Used by both the direct
       // completion path and reconcileSentCopy (which delegates here).
       const sentFolder = await this.resolveSentFolder(intent.mailboxId);
-      const existing = await provider.findByMessageId(
+      const existing = await session.findByMessageId(
         sentFolder,
         intent.messageId,
       );
       if (existing === null) {
         const built = await buildOutboundMime(outbound);
-        await provider.appendSentCopy(sentFolder, built.raw);
+        await session.appendSentCopy(sentFolder, built.raw);
       }
     } catch {
       await this.deps.attempts.compareAndSet({
@@ -444,6 +456,10 @@ export class SendExecutor {
       });
       log.warn("sent_copy_pending");
       return "sent_copy_pending";
+    } finally {
+      if (session !== null) {
+        await session.disconnect().catch(() => undefined);
+      }
     }
 
     const completed = await this.deps.attempts.compareAndSet({
@@ -475,25 +491,22 @@ export class SendExecutor {
   ): Promise<SendOutcome> {
     if (state === "completed") return "completed";
     const mailbox = await this.requireMailbox(intent.mailboxId);
-    const provider = await this.deps.providerFactory.create(mailbox);
-    try {
-      const payload = await this.deps.payloadResolver.resolve(intent);
-      const outbound: OutboundMessage = {
-        ...payload.message,
-        messageId: intent.messageId,
-      };
-      return await this.appendSentAndComplete(
-        intent,
-        attemptId,
-        version,
-        state,
-        provider,
-        outbound,
-        log,
-      );
-    } finally {
-      await provider.disconnect().catch(() => undefined);
-    }
+    const payload = await this.deps.payloadResolver.resolve(intent);
+    const outbound: OutboundMessage = {
+      ...payload.message,
+      messageId: intent.messageId,
+    };
+    // Delegates to appendSentAndComplete, which opens an IMAP session ONLY.
+    // Reconciliation after acceptance must NEVER construct a submission.
+    return this.appendSentAndComplete(
+      intent,
+      attemptId,
+      version,
+      state,
+      mailbox,
+      outbound,
+      log,
+    );
   }
 
   // ---- verification helpers ------------------------------------------------

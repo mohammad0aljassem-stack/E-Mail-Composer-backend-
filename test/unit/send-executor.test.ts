@@ -134,6 +134,10 @@ describe("SendExecutor — happy path", () => {
     expect(outcome).toBe("completed");
     expect(h.smtp.submissions).toHaveLength(1);
     expect(h.attempts.rows.get(ATTEMPT_ID)?.state).toBe("completed");
+    // C1: exactly ONE submission channel was constructed (after the guards),
+    // and the Sent copy went through an IMAP session.
+    expect(h.factory.submissionsCreated).toBe(1);
+    expect(h.factory.imapSessionsCreated).toBe(1);
   });
 
   // Test 19: the pre-generated Message-ID is reused for SMTP + Sent copy.
@@ -191,6 +195,8 @@ describe("SendExecutor — pre-send verification", () => {
     const outcome = await h.exec.execute(JOB);
     expect(outcome).toBe("needs_human_review");
     expect(h.smtp.submissions).toHaveLength(0);
+    // C1: integrity verification precedes submission construction.
+    expect(h.factory.submissionsCreated).toBe(0);
     expect(h.attempts.rows.get(ATTEMPT_ID)?.state).toBe("needs_human_review");
   });
 
@@ -283,6 +289,9 @@ describe("SendExecutor — restart safety", () => {
     expect(outcome).toBe("completed");
     // Reconciliation only — never a second SMTP submission.
     expect(h.smtp.submissions).toHaveLength(0);
+    // C1: reconciliation is IMAP-only — no submission channel is even built.
+    expect(h.factory.submissionsCreated).toBe(0);
+    expect(h.factory.imapSessionsCreated).toBe(1);
   });
 
   // Test 31: a restart while smtp_in_progress → needs_human_review (no resend).
@@ -352,6 +361,9 @@ describe("SendExecutor — authoritative sender at execution (B5)", () => {
     expect(outcome).toBe("failed_before_delivery");
     // ZERO SMTP bytes submitted.
     expect(h.smtp.submissions).toHaveLength(0);
+    // C1: the submission channel was never even CONSTRUCTED — the guard runs
+    // strictly before createSubmission.
+    expect(h.factory.submissionsCreated).toBe(0);
     expect(h.attempts.rows.get(ATTEMPT_ID)?.state).toBe(
       "failed_before_delivery",
     );
@@ -372,6 +384,7 @@ describe("SendExecutor — authoritative sender at execution (B5)", () => {
     // never sends (sender is still wrong); no SMTP is ever submitted.
     await h.exec.execute(JOB);
     expect(h.smtp.submissions).toHaveLength(0);
+    expect(h.factory.submissionsCreated).toBe(0); // never constructed either
   });
 
   // A workspace mismatch on the loaded mailbox also fails closed.
@@ -382,6 +395,7 @@ describe("SendExecutor — authoritative sender at execution (B5)", () => {
     const outcome = await h.exec.execute(JOB);
     expect(outcome).toBe("failed_before_delivery");
     expect(h.smtp.submissions).toHaveLength(0);
+    expect(h.factory.submissionsCreated).toBe(0); // C1: never constructed
     expect(h.attempts.rows.get(ATTEMPT_ID)?.evidence.reason).toBe(
       "sender_authority_workspace_mismatch",
     );
@@ -521,6 +535,7 @@ describe("SendExecutor — re-entry pins (T2/T3/T4)", () => {
     const outcome = await h.exec.execute(JOB);
     expect(outcome).toBe("completed");
     expect(h.smtp.submissions).toHaveLength(0);
+    expect(h.factory.submissionsCreated).toBe(0); // C1: IMAP-only re-entry
     const sent = [...h.server.folder("Sent").messages.values()];
     expect(sent.filter((m) => m.messageId === MESSAGE_ID)).toHaveLength(1);
   });

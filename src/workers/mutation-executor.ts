@@ -48,7 +48,8 @@ export class MutationExecutor {
       return;
     }
     const mailbox = await this.requireMailbox(job.mailboxId);
-    const provider = await this.deps.providerFactory.create(mailbox);
+    // IMAP session ONLY — a folder mutation must never construct an SMTP client.
+    const provider = await this.deps.providerFactory.createImapSession(mailbox);
     try {
       await provider.applyMutation(job.mutation);
       await this.deps.audit.append({

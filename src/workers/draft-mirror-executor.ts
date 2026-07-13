@@ -89,7 +89,8 @@ export class DraftMirrorExecutor {
     }
 
     const mailbox = await this.requireMailbox(job.mailboxId);
-    const provider = await this.deps.providerFactory.create(mailbox);
+    // IMAP session ONLY — draft mirroring must never construct an SMTP client.
+    const provider = await this.deps.providerFactory.createImapSession(mailbox);
     try {
       const previousUid =
         existing?.remoteUid !== undefined ? existing.remoteUid : null;

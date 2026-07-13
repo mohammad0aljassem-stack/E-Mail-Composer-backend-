@@ -171,8 +171,31 @@ describe("SyncExecutor", () => {
       uidValidityChanged: false,
       needsFollowUp: false,
     });
-    expect(h.factory.createdCount).toBe(0); // no provider, no IMAP connect
+    expect(h.factory.imapSessionsCreated).toBe(0); // no provider, no IMAP connect
+    expect(h.factory.submissionsCreated).toBe(0);
     expect(h.messages.rows.size).toBe(0);
+  });
+
+  // C1 (Phase 3B): read-only sync constructs an IMAP session ONLY — never an
+  // SMTP submission channel.
+  it("constructs only an IMAP session, never an SMTP submission", async () => {
+    const h = makeHarness();
+    h.server.seedMessage("INBOX", { messageId: "<m1@x>" });
+    await h.exec.execute(initialJob);
+    expect(h.factory.imapSessionsCreated).toBeGreaterThanOrEqual(1);
+    expect(h.factory.submissionsCreated).toBe(0);
+  });
+
+  // C1 (Phase 3B): an IMAP connect failure surfaces the error without any SMTP
+  // construction or verification (SMTP is simply never part of a sync).
+  it("propagates an IMAP connect failure without constructing SMTP", async () => {
+    const h = makeHarness();
+    h.server.connectOk = false;
+    await expect(h.exec.execute(initialJob)).rejects.toBeInstanceOf(
+      TransportError,
+    );
+    expect(h.factory.submissionsCreated).toBe(0);
+    expect(h.factory.smtp.submissions).toHaveLength(0);
   });
 
   // C9: a References header carried by the provider is persisted (threading).
@@ -270,7 +293,7 @@ describe("IMAP IDLE wake-up", () => {
     server.addFolder({ name: "INBOX", role: "inbox" });
     server.queueIdleSignal("INBOX", { kind: "exists" });
     const factory = new FakeProviderFactory(server, new FakeSmtpClient());
-    const provider = await factory.create(sendableMailbox());
+    const provider = await factory.createImapSession(sendableMailbox());
     const change = await provider.waitForChanges("INBOX", 1000);
     expect(change?.kind).toBe("exists");
     // A timeout with no signal returns null (bounded periodic fallback).

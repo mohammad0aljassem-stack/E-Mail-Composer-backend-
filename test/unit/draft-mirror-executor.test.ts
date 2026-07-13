@@ -52,7 +52,7 @@ function makeHarness(availableRevisions: bigint[] = [1n, 2n, 3n]) {
     logger,
     config: { draftsFolder: "Drafts" },
   });
-  return { exec, mirrors, server, audit };
+  return { exec, mirrors, server, audit, factory };
 }
 
 function job(revision: bigint) {
@@ -75,6 +75,9 @@ describe("DraftMirrorExecutor", () => {
     expect(row?.remoteUid).toBe(1n);
     expect(row?.remoteUidvalidity).toBe(7n); // UID namespaced by UIDVALIDITY
     expect(h.server.folder("Drafts").messages.size).toBe(1);
+    // C1 (Phase 3B): mirroring uses an IMAP session ONLY — never a submission.
+    expect(h.factory.imapSessionsCreated).toBe(1);
+    expect(h.factory.submissionsCreated).toBe(0);
   });
 
   // Test 14: idempotent on (draftId, revision) — re-running does not duplicate.

@@ -75,7 +75,8 @@ export class SyncExecutor {
     }
 
     const mailbox = await this.requireSyncableMailbox(job.mailboxId);
-    const provider = await this.deps.providerFactory.create(mailbox);
+    // IMAP session ONLY — read-only sync must never construct an SMTP client.
+    const provider = await this.deps.providerFactory.createImapSession(mailbox);
     try {
       // Initial mode: (re)discover folders so roles + uidvalidity are current.
       if (job.mode === "initial") {
