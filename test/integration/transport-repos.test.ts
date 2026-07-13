@@ -254,6 +254,13 @@ d("confirmation-proof parity: SQL RPC vs TS re-derivation", () => {
         `select set_config('request.jwt.claim.sub', $1, false)`,
         [ctx.userId],
       );
+      // Sender authority (hardening migration): p_sender MUST equal the mailbox
+      // address after trim+lowercase, so pass the seeded mailbox's own address.
+      const mb = await client.query<{ email_address: string }>(
+        `select email_address from public.mailboxes where id = $1`,
+        [ctx.mailboxId],
+      );
+      const senderAddr = mb.rows[0]!.email_address;
       const res = await client.query<{
         id: string;
         message_id: string;
@@ -266,14 +273,14 @@ d("confirmation-proof parity: SQL RPC vs TS re-derivation", () => {
         contract_version: number;
       }>(
         `select * from public.create_send_intent(
-           $1,$2,$3, 1, 'sender@test.local',
+           $1,$2,$3, 1, $4,
            '{"to":["r@test.local"],"cc":["c@test.local"]}'::jsonb,
            'Hello subject',
            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
            null,
            '[{"filename":"a.txt","contentType":"text/plain","sizeBytes":3,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]'::jsonb
          )`,
-        [ctx.workspaceId, ctx.mailboxId, ctx.draftId],
+        [ctx.workspaceId, ctx.mailboxId, ctx.draftId, senderAddr],
       );
       const row = res.rows[0]!;
       const intent: SendIntentRow = {

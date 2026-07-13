@@ -6,6 +6,7 @@ import type {
   SendAttemptRow,
   SendIntentRow,
   StoredCredential,
+  SyncRequestRow,
 } from "../../src/domain/models.js";
 import { canTransition, type SendState } from "../../src/domain/send-state.js";
 import type {
@@ -18,6 +19,7 @@ import type {
   MessageStore,
   SendAttemptStore,
   SendIntentReader,
+  SyncRequestStore,
   WorkerClaimStore,
 } from "../../src/db/repository-interfaces.js";
 
@@ -315,6 +317,138 @@ export class FakeAuditRepo implements AuditWriter {
   public append(input: AuditEvent): Promise<void> {
     this.events.push(input);
     return Promise.resolve();
+  }
+}
+
+/**
+ * In-memory transport.sync_requests faithful to the real claim semantics: the
+ * atomic claim is single-holder (a row can only be claimed by one caller per
+ * pass), a fresh claim is never stolen, a stale claim past the lease is
+ * reclaimable, and attempt_count is the bound. Insertion is via `seed` because
+ * the worker itself never INSERTs (the DEFINER RPC does).
+ */
+export class FakeSyncRequestRepo implements SyncRequestStore {
+  public readonly rows = new Map<string, SyncRequestRow>();
+  private seq = 1;
+
+  /** Test-only INSERT (stands in for the DEFINER RPC). */
+  public seed(input: {
+    workspaceId: string;
+    mailboxId: string;
+    folder?: string | null;
+    status?: SyncRequestRow["status"];
+    requestedAt?: Date;
+    claimedAt?: Date | null;
+    attemptCount?: number;
+  }): SyncRequestRow {
+    const id = `sync-req-${this.seq++}`;
+    const row: SyncRequestRow = {
+      id,
+      workspaceId: input.workspaceId,
+      mailboxId: input.mailboxId,
+      folder: input.folder ?? null,
+      status: input.status ?? "pending",
+      requestedBy: null,
+      requestedAt: input.requestedAt ?? new Date(0),
+      claimedAt: input.claimedAt ?? null,
+      completedAt: null,
+      attemptCount: input.attemptCount ?? 0,
+      lastError: null,
+    };
+    this.rows.set(id, row);
+    return row;
+  }
+
+  public claimBatch(input: {
+    limit: number;
+    now: Date;
+    leaseCutoff: Date;
+    maxAttempts: number;
+  }): Promise<SyncRequestRow[]> {
+    const eligible = [...this.rows.values()]
+      .filter(
+        (r) =>
+          r.attemptCount < input.maxAttempts &&
+          (r.status === "pending" ||
+            (r.status === "claimed" &&
+              r.claimedAt !== null &&
+              r.claimedAt.getTime() < input.leaseCutoff.getTime())),
+      )
+      .sort((a, b) => a.requestedAt.getTime() - b.requestedAt.getTime())
+      .slice(0, input.limit);
+    const claimed: SyncRequestRow[] = [];
+    for (const r of eligible) {
+      const updated: SyncRequestRow = {
+        ...r,
+        status: "claimed",
+        claimedAt: input.now,
+        attemptCount: r.attemptCount + 1,
+      };
+      this.rows.set(r.id, updated);
+      claimed.push(updated);
+    }
+    return Promise.resolve(claimed);
+  }
+
+  public markCompleted(id: string, now: Date): Promise<SyncRequestRow | null> {
+    const r = this.rows.get(id);
+    if (r === undefined || r.status !== "claimed") return Promise.resolve(null);
+    const updated: SyncRequestRow = {
+      ...r,
+      status: "completed",
+      completedAt: now,
+    };
+    this.rows.set(id, updated);
+    return Promise.resolve(updated);
+  }
+
+  public markFailed(input: {
+    id: string;
+    now: Date;
+    lastError: string;
+  }): Promise<SyncRequestRow | null> {
+    const r = this.rows.get(input.id);
+    if (r === undefined || (r.status !== "claimed" && r.status !== "pending")) {
+      return Promise.resolve(null);
+    }
+    const updated: SyncRequestRow = {
+      ...r,
+      status: "failed",
+      completedAt: input.now,
+      lastError: input.lastError.slice(0, 200),
+    };
+    this.rows.set(input.id, updated);
+    return Promise.resolve(updated);
+  }
+
+  public reapExhausted(input: {
+    now: Date;
+    leaseCutoff: Date;
+    maxAttempts: number;
+    lastError: string;
+  }): Promise<number> {
+    let n = 0;
+    for (const [id, r] of this.rows) {
+      if (
+        r.status === "claimed" &&
+        r.claimedAt !== null &&
+        r.claimedAt.getTime() < input.leaseCutoff.getTime() &&
+        r.attemptCount >= input.maxAttempts
+      ) {
+        this.rows.set(id, {
+          ...r,
+          status: "failed",
+          completedAt: input.now,
+          lastError: input.lastError.slice(0, 200),
+        });
+        n += 1;
+      }
+    }
+    return Promise.resolve(n);
+  }
+
+  public getById(id: string): Promise<SyncRequestRow | null> {
+    return Promise.resolve(this.rows.get(id) ?? null);
   }
 }
 

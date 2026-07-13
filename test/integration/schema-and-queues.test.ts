@@ -34,8 +34,14 @@ d("canonical schema is loaded", () => {
         where table_schema = 'transport'`,
     );
     const names = r.rows.map((x) => x.table_name).sort();
+    // The full canonical chain adds transport.sync_requests (hardening migration).
     expect(names).toEqual(
-      ["mailbox_credentials", "worker_claims", "worker_heartbeats"].sort(),
+      [
+        "mailbox_credentials",
+        "sync_requests",
+        "worker_claims",
+        "worker_heartbeats",
+      ].sort(),
     );
   });
 
