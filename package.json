@@ -20,6 +20,7 @@
     "test:coverage": "vitest run --project unit --coverage",
     "test:integration": "vitest run --project integration",
     "test:db": "bash scripts/test-db.sh",
+    "contract:verify": "node scripts/verify-contract.mjs",
     "license:check": "node scripts/license-check.mjs",
     "secret:scan": "bash scripts/secret-scan.sh",
     "audit:prod": "pnpm audit --prod --audit-level high",
