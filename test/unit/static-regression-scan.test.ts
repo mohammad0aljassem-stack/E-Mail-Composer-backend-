@@ -193,6 +193,7 @@ describe("C1 — SMTP capability is confined to the submission factory path", ()
     "src/workers/draft-mirror-payload-resolver.ts",
     "src/workers/send-payload-resolver.ts",
     "src/workers/sync-request-dispatcher.ts",
+    "src/workers/idle-coordinator.ts",
   ];
 
   it("SMTP client construction happens only in the allowlisted files", () => {
@@ -359,6 +360,75 @@ describe("B7 — send_message acquires no retry behavior", () => {
       .filter((l) => !l.trim().startsWith("//"))
       .join("\n");
     expect(code).not.toMatch(/retryLimit\s*:/);
+  });
+});
+
+describe("C7 — the IDLE coordinator is gated and IMAP-only", () => {
+  it("the registration plan gates idle on master && sync && idle", () => {
+    const code = read("src/entrypoints/registration-plan.ts");
+    expect(
+      /idle:\s*master\s*&&\s*config\.syncEnabled\s*&&\s*config\.idleEnabled/.test(
+        code,
+      ),
+    ).toBe(true);
+  });
+
+  it("worker.ts constructs the IdleCoordinator only inside the plan.idle branch", () => {
+    const code = codeLines(read("src/entrypoints/worker.ts")).join("\n");
+    const gate = code.indexOf("if (plan.idle)");
+    const construction = code.indexOf("new IdleCoordinator");
+    expect(gate).toBeGreaterThanOrEqual(0);
+    expect(construction).toBeGreaterThan(gate);
+  });
+
+  it("the coordinator depends only on the createImapSession capability slice", () => {
+    const code = read("src/workers/idle-coordinator.ts");
+    expect(code).toContain('Pick<ProviderFactory, "createImapSession">');
+  });
+});
+
+describe("Phase 3B — no real IONOS hostname in tests", () => {
+  // Assembled at runtime so this scan file never matches itself. The docs
+  // may show provider-shaped host EXAMPLES (docs/env-reference.md); test
+  // code must never name a real IONOS endpoint — tests run against the
+  // in-repo fakes only.
+  const banned = ".io" + "nos.";
+  it("test/ contains no dotted IONOS hostname literal", () => {
+    for (const rel of walk("test", [".ts"])) {
+      expect(
+        read(rel).toLowerCase().includes(banned),
+        `IONOS hostname literal in ${rel}`,
+      ).toBe(false);
+    }
+  });
+});
+
+describe("Phase 3B — the production project ref appears only in its denylist fixtures", () => {
+  // The ONLY sanctioned occurrences: the provisioning CLI (which DEFINES the
+  // refusal denylist), the unit test that asserts the refusal, and this scan.
+  const PROD_REF_FIXTURES = new Set<string>([
+    "src/entrypoints/provision-credential.ts",
+    "test/unit/crypto.test.ts",
+    "test/unit/static-regression-scan.test.ts",
+  ]);
+  const prodRef = "fpanvpxjjddhasjmpflz";
+  it("src/ and test/ never reference the production project ref elsewhere", () => {
+    for (const rel of [...walk("src", [".ts"]), ...walk("test", [".ts"])]) {
+      if (PROD_REF_FIXTURES.has(rel)) continue;
+      expect(
+        read(rel).includes(prodRef),
+        `production project ref in ${rel}`,
+      ).toBe(false);
+    }
+  });
+
+  it("the sanctioned fixtures keep the ref denylisted, not connectable", () => {
+    // The CLI must still define the refusal constant, and the test must
+    // assert refusal — deleting either would silently disarm the tripwire.
+    expect(read("src/entrypoints/provision-credential.ts")).toContain(
+      `PROD_PROJECT_REF = "${prodRef}"`,
+    );
+    expect(read("test/unit/crypto.test.ts")).toContain(prodRef);
   });
 });
 
