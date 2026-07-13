@@ -74,6 +74,12 @@ export interface SyncMailboxJob {
   readonly mailboxId: string;
   readonly folder: string;
   readonly mode: "initial" | "incremental";
+  /**
+   * Set when this job was dispatched from a durable transport.sync_requests row.
+   * Carried end-to-end so the executor can mark that durable request
+   * completed/failed. Absent for ad-hoc (IDLE-wakeup) syncs.
+   */
+  readonly syncRequestId?: string;
 }
 
 export interface DraftMirrorJob {
@@ -104,6 +110,13 @@ export interface ApplyMutationJob {
 export const singletonKeys = {
   syncMailbox: (mailboxId: string, folder: string): string =>
     `sync:${mailboxId}:${folder}`,
+  /**
+   * Durable-request dispatch key: DETERMINISTIC in the sync_request id so a
+   * re-claim (crash / lease expiry) never enqueues a duplicate job for the same
+   * request, and whole-mailbox vs folder-scoped requests (distinct rows/ids per
+   * the canonical uq_sync_requests_open dedup) map to distinct keys.
+   */
+  syncRequest: (syncRequestId: string): string => `sync-req:${syncRequestId}`,
   draftMirror: (draftId: string, revision: string): string =>
     `draft:${draftId}:${revision}`,
   sendMessage: (sendIntentId: string): string => `send:${sendIntentId}`,

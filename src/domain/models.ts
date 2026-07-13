@@ -130,3 +130,27 @@ export interface StoredCredential {
   keyVersion: number;
   aad: string;
 }
+
+export type SyncRequestStatus = "pending" | "claimed" | "completed" | "failed";
+
+/**
+ * A durable, claimable mailbox-sync request (transport.sync_requests). Inserted
+ * ONLY by the SECURITY DEFINER RPC `request_mailbox_sync`; the worker holds
+ * exactly SELECT + UPDATE (never INSERT/DELETE) and drives the lifecycle
+ * pending -> claimed -> completed|failed. `folder === null` means a whole-mailbox
+ * sync; a non-null value narrows it to one folder. `lastError` is content-free
+ * and bounded (a short code only — never body/MIME/credentials/provider payload).
+ */
+export interface SyncRequestRow {
+  id: string;
+  workspaceId: string;
+  mailboxId: string;
+  folder: string | null;
+  status: SyncRequestStatus;
+  requestedBy: string | null;
+  requestedAt: Date;
+  claimedAt: Date | null;
+  completedAt: Date | null;
+  attemptCount: number;
+  lastError: string | null;
+}
