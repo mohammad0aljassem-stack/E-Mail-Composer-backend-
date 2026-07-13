@@ -17,6 +17,7 @@ import type {
   FolderRole,
   SendRecipients,
 } from "../domain/models.js";
+import type { BuiltMime } from "../mime/outbound-builder.js";
 
 export const MAIL_PROVIDER_CONTRACT_VERSION = 1 as const;
 
@@ -188,7 +189,15 @@ export interface SubmissionProvider {
    */
   verifySmtp(): Promise<void>;
 
-  sendMessage(message: OutboundMessage): Promise<SendResult>;
+  /**
+   * Submit the message. When `prebuilt` is provided (the send executor's
+   * build-once path, C5), those EXACT bytes go on the wire — no rebuild — so
+   * the SMTP DATA payload and the later Sent-folder copy are byte-identical.
+   */
+  sendMessage(
+    message: OutboundMessage,
+    prebuilt?: BuiltMime,
+  ): Promise<SendResult>;
 
   /**
    * Release submission resources (no-op is acceptable for connectionless

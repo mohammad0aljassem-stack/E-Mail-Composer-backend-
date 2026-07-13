@@ -613,6 +613,88 @@ describe("SendExecutor — audit-event assertions (T6)", () => {
   });
 });
 
+describe("SendExecutor — build once, reuse exact bytes (C5)", () => {
+  const PINNED_MS = 1_700_000_000_000; // TestClock start
+  const pinnedUtc = new Date(PINNED_MS).toUTCString();
+  const pinnedHeader = `Date: ${pinnedUtc.replace("GMT", "+0000")}`;
+
+  it("the appended Sent copy is byte-identical to the SMTP submission", async () => {
+    const h = await makeHarness();
+    await h.exec.execute(JOB);
+    expect(h.smtp.submissions).toHaveLength(1);
+    const submitted = h.smtp.submissions[0]!.raw;
+    const sent = [...h.server.folder("Sent").messages.values()].find(
+      (m) => m.messageId === MESSAGE_ID,
+    );
+    expect(sent?.raw).not.toBeNull();
+    // ONE build per execution: submitted raw === appended raw, byte for byte.
+    expect(sent!.raw!.equals(submitted)).toBe(true);
+  });
+
+  it("persists the pinned MIME date content-free in evidence at build time", async () => {
+    const h = await makeHarness();
+    await h.exec.execute(JOB);
+    const row = h.attempts.rows.get(ATTEMPT_ID)!;
+    expect(row.evidence.mime_date).toBe(pinnedUtc);
+    // The submitted Date header carries exactly the persisted date.
+    expect(h.smtp.submissions[0]!.raw.toString("utf8")).toContain(pinnedHeader);
+  });
+
+  it("restart reconcile rebuilds the Sent copy with the evidence-pinned date", async () => {
+    const h = await makeHarness();
+    const pinned = "Tue, 30 Jun 2026 09:00:00 GMT";
+    h.attempts.rows.set(ATTEMPT_ID, {
+      ...h.fixture.attempt("smtp_accepted", 5n),
+      evidence: { mime_date: pinned },
+    });
+    const outcome = await h.exec.execute(JOB);
+    expect(outcome).toBe("completed");
+    expect(h.smtp.submissions).toHaveLength(0); // never SMTP again
+    const sent = [...h.server.folder("Sent").messages.values()].find(
+      (m) => m.messageId === MESSAGE_ID,
+    );
+    expect(sent?.raw?.toString("utf8")).toContain(
+      "Date: Tue, 30 Jun 2026 09:00:00 +0000",
+    );
+  });
+
+  it("reconcile with an existing Sent copy never re-resolves or rebuilds", async () => {
+    const h = await makeHarness();
+    h.server.seedMessage("Sent", { messageId: MESSAGE_ID });
+    h.setState("smtp_accepted", 5n);
+    let resolves = 0;
+    h.deps.payloadResolver = {
+      resolve: () => {
+        resolves += 1;
+        return Promise.resolve(h.fixture.payload);
+      },
+    };
+    h.exec = new SendExecutor(h.deps);
+    expect(await h.exec.execute(JOB)).toBe("completed");
+    // findByMessageId runs FIRST; the raw bytes are only rematerialized when
+    // an append is actually needed.
+    expect(resolves).toBe(0);
+  });
+
+  it("parks sent_copy_pending when a restart rebuild diverges from the intent", async () => {
+    const h = await makeHarness();
+    h.setState("smtp_accepted", 5n);
+    h.deps.payloadResolver = {
+      resolve: () =>
+        Promise.resolve({
+          revision: h.fixture.payload.revision,
+          message: { ...h.fixture.message, html: "<p>tampered later</p>" },
+        }),
+    };
+    h.exec = new SendExecutor(h.deps);
+    const outcome = await h.exec.execute(JOB);
+    // Divergent bytes are NEVER appended, and SMTP is never re-entered.
+    expect(outcome).toBe("sent_copy_pending");
+    expect(h.server.folder("Sent").messages.size).toBe(0);
+    expect(h.smtp.submissions).toHaveLength(0);
+  });
+});
+
 // Test 37: end-to-end, no body/credential/attachment bytes appear in logs.
 describe("SendExecutor — content-free logging", () => {
   it("never logs body/credential/attachment content", async () => {

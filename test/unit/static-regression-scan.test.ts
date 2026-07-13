@@ -291,6 +291,31 @@ describe("C4 — the production send-payload resolver is real (no stub)", () => 
   });
 });
 
+describe("C5 — outbound MIME is built once with a pinned date", () => {
+  it("every buildOutboundMime call in the send executor pins a date", () => {
+    const lines = read("src/workers/send-executor.ts").split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      if (!lines[i]!.includes("buildOutboundMime(")) continue;
+      const window = lines.slice(i, i + 4).join("\n");
+      expect(
+        window.includes("date"),
+        `un-pinned buildOutboundMime near send-executor.ts line ${i + 1}`,
+      ).toBe(true);
+    }
+  });
+
+  it("the send MIME path never stamps an ad-hoc bare `new Date()`", () => {
+    for (const rel of [
+      "src/workers/send-executor.ts",
+      "src/mime/outbound-builder.ts",
+    ]) {
+      expect(/new Date\(\)/.test(read(rel)), `bare new Date() in ${rel}`).toBe(
+        false,
+      );
+    }
+  });
+});
+
 describe("B7 — send_message acquires no retry behavior", () => {
   it("the send_message queue block keeps retryLimit 0 / retryBackoff false", () => {
     const src = read("src/queues/queue-config.ts");

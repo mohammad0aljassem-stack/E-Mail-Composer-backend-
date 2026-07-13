@@ -8,11 +8,13 @@ import type { Clock } from "../domain/clock.js";
 import type {
   AttachmentManifestEntry,
   MailboxRow,
+  SendAttemptRow,
   SendIntentRow,
   SendRecipients,
 } from "../domain/models.js";
 import { isPostAcceptance, isTerminal } from "../domain/send-state.js";
 import { buildOutboundMime } from "../mime/outbound-builder.js";
+import type { BuiltMime } from "../mime/outbound-builder.js";
 import type { Logger } from "../observability/logger.js";
 import type {
   AuditWriter,
@@ -171,6 +173,7 @@ export class SendExecutor {
         attempt.id,
         attempt.version,
         attempt.state as "smtp_accepted" | "sent_copy_pending" | "completed",
+        attempt.evidence,
         log,
       );
     }
@@ -246,7 +249,22 @@ export class SendExecutor {
         log.warn("send_payload_resolution_failed", { reason });
         return "failed_before_delivery";
       }
-      const integrity = await this.verifyIntegrity(intent, payload);
+      // (C5) BUILD ONCE: the raw MIME for this execution is constructed here
+      // — a single time — with a Date pinned from the worker clock. The SAME
+      // built artifact then serves (a) the hash re-verification below, (b)
+      // the SMTP submission and (c) the Sent-folder append, so the bytes the
+      // user's mailbox stores are byte-identical to the bytes submitted. The
+      // pinned date is persisted content-free in the attempt evidence
+      // (mime_date) at the smtp_in_progress transition so a RESTART rebuild
+      // reproduces the same Date header.
+      const outbound: OutboundMessage = {
+        ...payload.message,
+        messageId: intent.messageId,
+      };
+      const mimeDate = this.deps.clock.now();
+      const built = await buildOutboundMime(outbound, { date: mimeDate });
+
+      const integrity = this.verifyIntegrity(intent, payload, built);
       if (integrity.kind === "human") {
         await this.toNeedsHumanReview(intent, cur.id, cur.version, "claimed", {
           reason: integrity.reason,
@@ -279,10 +297,6 @@ export class SendExecutor {
         return "failed_before_delivery";
       }
 
-      const outbound: OutboundMessage = {
-        ...payload.message,
-        messageId: intent.messageId,
-      };
       // (C1) Capability-scoped construction: the SMTP submission channel is
       // built ONLY here — strictly AFTER the integrity verification (4) and
       // the sender-authority guard (4b) above. No other code path may call
@@ -297,6 +311,8 @@ export class SendExecutor {
           mailbox,
           submission,
           outbound,
+          built,
+          mimeDate.toUTCString(),
           log,
         );
       } finally {
@@ -314,15 +330,23 @@ export class SendExecutor {
     mailbox: MailboxRow,
     submission: SubmissionProvider,
     outbound: OutboundMessage,
+    built: BuiltMime,
+    mimeDate: string,
     log: Logger,
   ): Promise<SendOutcome> {
     // claimed -> smtp_in_progress (a crash from here = ambiguous on restart).
+    // The pinned MIME Date is persisted content-free (an RFC-2822 date names
+    // no body/recipient) BEFORE the network call, so a restart rebuild for
+    // Sent-copy reconciliation reuses the exact same Date header.
     const inProgress = await this.deps.attempts.compareAndSet({
       id: attemptId,
       expectedVersion: versionAtClaimed,
       expectedState: "claimed",
       toState: "smtp_in_progress",
-      fields: { messageId: intent.messageId },
+      fields: {
+        messageId: intent.messageId,
+        evidence: { mime_date: mimeDate },
+      },
     });
     if (inProgress === null) return "claim_lost";
 
@@ -337,7 +361,9 @@ export class SendExecutor {
 
     let sendResult: SendResult;
     try {
-      sendResult = await submission.sendMessage(outbound); // OUTSIDE any txn
+      // OUTSIDE any txn. The prebuilt artifact carries the wire bytes: the
+      // submission must NOT rebuild (build-once, C5).
+      sendResult = await submission.sendMessage(outbound, built);
     } catch (err) {
       if (err instanceof SmtpPreDataError) {
         await this.deps.attempts.compareAndSet({
@@ -427,13 +453,15 @@ export class SendExecutor {
       messageId: intent.messageId,
     });
 
+    // In-run path: the Sent copy is the EXACT Buffer just submitted — no
+    // rebuild, byte-identical by construction (C5).
     return this.appendSentAndComplete(
       intent,
       attemptId,
       accepted.version,
       "smtp_accepted",
       mailbox,
-      outbound,
+      () => Promise.resolve(built.raw),
       log,
     );
   }
@@ -444,7 +472,7 @@ export class SendExecutor {
     version: bigint,
     fromState: "smtp_accepted" | "sent_copy_pending",
     mailbox: MailboxRow,
-    outbound: OutboundMessage,
+    rawForAppend: () => Promise<Buffer>,
     log: Logger,
   ): Promise<SendOutcome> {
     // Sent-copy work is IMAP-ONLY: an IMAP session is created here and NEVER a
@@ -457,13 +485,14 @@ export class SendExecutor {
       // default when discovery has no sent-role row. Used by both the direct
       // completion path and reconcileSentCopy (which delegates here).
       const sentFolder = await this.resolveSentFolder(intent.mailboxId);
+      // Message-ID search FIRST: an existing copy is never appended twice, and
+      // the raw bytes are only (re)materialized when an append is needed.
       const existing = await session.findByMessageId(
         sentFolder,
         intent.messageId,
       );
       if (existing === null) {
-        const built = await buildOutboundMime(outbound);
-        await session.appendSentCopy(sentFolder, built.raw);
+        await session.appendSentCopy(sentFolder, await rawForAppend());
       }
     } catch {
       await this.deps.attempts.compareAndSet({
@@ -506,14 +535,45 @@ export class SendExecutor {
     attemptId: string,
     version: bigint,
     state: "smtp_accepted" | "sent_copy_pending" | "completed",
+    evidence: SendAttemptRow["evidence"],
     log: Logger,
   ): Promise<SendOutcome> {
     if (state === "completed") return "completed";
     const mailbox = await this.requireMailbox(intent.mailboxId);
-    const payload = await this.deps.payloadResolver.resolve(intent);
-    const outbound: OutboundMessage = {
-      ...payload.message,
-      messageId: intent.messageId,
+    // RESTART rebuild (C5, lazy — only when findByMessageId shows the copy is
+    // actually missing): the payload is re-resolved from the immutable
+    // snapshot and rebuilt with the SAME Message-ID and the SAME pinned Date
+    // persisted in the attempt evidence at build time. PROVEN EQUIVALENCE:
+    // Message-ID, Date, From/To/Subject and the hash-verified bodies are all
+    // identical to the submitted message, so the rebuilt bytes differ from
+    // the wire bytes ONLY in MailComposer's random multipart boundary
+    // strings (pinned by unit test "pinned-date rebuild"). A hash mismatch
+    // on rebuild throws → the catch below parks sent_copy_pending: nothing
+    // divergent is ever appended, and SMTP is never re-entered.
+    const rawForAppend = async (): Promise<Buffer> => {
+      const payload = await this.deps.payloadResolver.resolve(intent);
+      const outbound: OutboundMessage = {
+        ...payload.message,
+        messageId: intent.messageId,
+      };
+      const pinned = evidence.mime_date;
+      const parsed = typeof pinned === "string" ? new Date(pinned) : null;
+      const date =
+        parsed !== null && !Number.isNaN(parsed.getTime())
+          ? parsed
+          : this.deps.clock.now();
+      const rebuilt = await buildOutboundMime(outbound, { date });
+      if (
+        (intent.htmlHash ?? null) !== (rebuilt.htmlHash ?? null) ||
+        (intent.textHash ?? null) !== (rebuilt.textHash ?? null) ||
+        !manifestEqual(rebuilt.attachmentManifest, intent.attachmentManifest)
+      ) {
+        throw new TransportError(
+          "send_precondition_failed",
+          "sent-copy rebuild does not match the confirmed intent",
+        );
+      }
+      return rebuilt.raw;
     };
     // Delegates to appendSentAndComplete, which opens an IMAP session ONLY.
     // Reconciliation after acceptance must NEVER construct a submission.
@@ -523,7 +583,7 @@ export class SendExecutor {
       version,
       state,
       mailbox,
-      outbound,
+      rawForAppend,
       log,
     );
   }
@@ -545,10 +605,17 @@ export class SendExecutor {
     return mailbox !== null && mailbox.enabled && !mailbox.killSwitch;
   }
 
-  private async verifyIntegrity(
+  /**
+   * Compares the resolved payload AND the once-built MIME artifact against the
+   * immutable intent. `built` is the same artifact later submitted/appended
+   * (build-once, C5), so what is verified here is literally what goes on the
+   * wire.
+   */
+  private verifyIntegrity(
     intent: SendIntentRow,
     payload: ResolvedSendPayload,
-  ): Promise<IntegrityResult> {
+    built: BuiltMime,
+  ): IntegrityResult {
     // Confirmation presence + proof integrity → human review on mismatch.
     if (
       intent.confirmedBy.length === 0 ||
@@ -570,10 +637,6 @@ export class SendExecutor {
     if (!recipientsEqual(m.recipients, intent.recipients)) {
       return { kind: "failed", reason: "recipients_mismatch" };
     }
-    const built = await buildOutboundMime({
-      ...m,
-      messageId: intent.messageId,
-    });
     if ((intent.htmlHash ?? null) !== (built.htmlHash ?? null)) {
       return { kind: "failed", reason: "html_hash_mismatch" };
     }

@@ -63,9 +63,19 @@ function flattenRecipients(r: SendRecipients): {
 /**
  * Build the RFC 5322 message bytes for an outbound message, embedding the
  * pre-generated Message-ID. Returns hashes for confirmation re-verification.
+ *
+ * `options.date` pins the Date header (C5): the send executor derives one
+ * date per attempt, persists it content-free in the attempt evidence, and
+ * passes it to EVERY build for that intent so an in-run Sent append reuses
+ * the exact submitted bytes and a restart rebuild reproduces the same
+ * headers. Without a pinned date MailComposer stamps "now", which made every
+ * rebuild byte-different. Two builds with the same inputs + same date differ
+ * ONLY in MailComposer's random multipart boundary strings (proven by unit
+ * test); the in-run submit/append path shares one Buffer and is byte-exact.
  */
 export async function buildOutboundMime(
   message: OutboundMessage,
+  options?: { date?: Date },
 ): Promise<BuiltMime> {
   const { to, cc, bcc } = flattenRecipients(message.recipients);
 
@@ -78,6 +88,7 @@ export async function buildOutboundMime(
     ...(message.text !== null ? { text: message.text } : {}),
     ...(message.html !== null ? { html: message.html } : {}),
     messageId: message.messageId,
+    ...(options?.date !== undefined ? { date: options.date } : {}),
     attachments: message.attachments.map((a) => ({
       filename: a.filename,
       content: a.content,

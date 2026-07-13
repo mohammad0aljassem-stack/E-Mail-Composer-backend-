@@ -143,6 +143,68 @@ describe("outbound MIME + hashing", () => {
     expect(built.raw.toString("utf8")).toContain("Cc: c@ex.com");
   });
 
+  it("pins the Date header when an explicit date is provided (C5)", async () => {
+    const date = new Date("2026-07-01T10:00:00Z");
+    const built = await buildOutboundMime(
+      {
+        messageId: "<pin@ex.com>",
+        sender: "a@ex.com",
+        recipients: { to: ["b@ex.com"] },
+        subject: "s",
+        html: "<p>hi</p>",
+        text: "hi",
+        attachments: [],
+      },
+      { date },
+    );
+    expect(built.raw.toString("utf8")).toContain(
+      "Date: Wed, 01 Jul 2026 10:00:00 +0000",
+    );
+  });
+
+  // C5 PROVEN EQUIVALENCE: with the same inputs AND the same pinned date, two
+  // independent builds are identical except for MailComposer's random
+  // multipart boundary strings. This is the documented guarantee the restart
+  // Sent-copy rebuild relies on (the in-run submit/append path shares ONE
+  // Buffer and is byte-exact — pinned in the send-executor suite).
+  it("rebuild with pinned date differs ONLY in the multipart boundary", async () => {
+    const message = {
+      messageId: "<same@ex.com>",
+      sender: "a@ex.com",
+      recipients: { to: ["b@ex.com"], cc: ["c@ex.com"] },
+      subject: "Rebuild equivalence",
+      html: "<p>bodyÄ</p>",
+      text: "bodyÄ",
+      attachments: [],
+    };
+    const date = new Date("2026-07-01T10:00:00Z");
+    const a = await buildOutboundMime(message, { date });
+    const b = await buildOutboundMime(message, { date });
+
+    const boundaryOf = (raw: Buffer): string => {
+      const m = /boundary="([^"]+)"/.exec(raw.toString("utf8"));
+      expect(m).not.toBeNull();
+      return m![1]!;
+    };
+    const ba = boundaryOf(a.raw);
+    const bb = boundaryOf(b.raw);
+
+    // Normalize each build by erasing its own boundary token; the remainder
+    // must be byte-identical.
+    const normalize = (raw: Buffer, boundary: string): string =>
+      raw.toString("utf8").split(boundary).join("BOUNDARY");
+    expect(normalize(a.raw, ba)).toBe(normalize(b.raw, bb));
+
+    // And the identity-bearing headers are byte-identical as-is.
+    const headerLines = (raw: Buffer): string[] =>
+      raw
+        .toString("utf8")
+        .split("\r\n")
+        .filter((l) => /^(Message-ID|Date|From|To|Cc|Subject):/i.test(l));
+    expect(headerLines(a.raw)).toEqual(headerLines(b.raw));
+    expect(headerLines(a.raw)).toHaveLength(6);
+  });
+
   it("computes an order-stable attachment manifest", () => {
     const manifest = computeAttachmentManifest([
       {

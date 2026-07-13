@@ -1,4 +1,5 @@
 import { buildOutboundMime } from "../../mime/outbound-builder.js";
+import type { BuiltMime } from "../../mime/outbound-builder.js";
 import type {
   AppendResult,
   DiscoveredFolder,
@@ -239,8 +240,15 @@ export class SmtpSubmission implements SubmissionProvider {
     await this.smtp.verify();
   }
 
-  public async sendMessage(message: OutboundMessage): Promise<SendResult> {
-    const built = await buildOutboundMime(message);
+  public async sendMessage(
+    message: OutboundMessage,
+    prebuilt?: BuiltMime,
+  ): Promise<SendResult> {
+    // C5: the send executor builds the MIME exactly once (pinned Date) and
+    // passes it here so the submitted bytes are the SAME Buffer later
+    // appended to Sent. The fallback build exists only for callers outside
+    // the executor path (none in production today).
+    const built = prebuilt ?? (await buildOutboundMime(message));
     const envelopeTo = [
       ...message.recipients.to,
       ...(message.recipients.cc ?? []),
