@@ -37,9 +37,32 @@ backend and the canonical transport contract (see
 It reads the pin from the backend lock and the migration checksums from the UI
 manifest — no value here is a secret and none is ever logged.
 
+## IONOS example values (examples only)
+
+> **Examples only.** IMAP/SMTP endpoints are **configured per mailbox row**
+> (`public.mailboxes.imap_host/imap_port/imap_security/smtp_host/smtp_port/smtp_security`)
+> and are **never hard-coded** in this repository. These are the typical
+> IONOS-shaped values an operator would enter for a controlled test mailbox —
+> substitute the values from the provider's own documentation for the actual
+> account:
+
+| Protocol | Host (example)   | Port | Security                    |
+| -------- | ---------------- | ---- | --------------------------- |
+| IMAP     | `imap.ionos.tld` | 993  | `ssl` (implicit TLS)        |
+| SMTP     | `smtp.ionos.tld` | 465  | `ssl` (implicit TLS)        |
+| SMTP     | `smtp.ionos.tld` | 587  | `starttls` (upgrade to TLS) |
+
+The provider factory **refuses** `imap_security`/`smtp_security` of `none` (or
+unset): a plaintext session is never built. IMAP `starttls` currently maps to
+implicit TLS (`secure=true`) — fail-closed, never plaintext.
+
 ## Fail-closed rules
 
 - Missing `DATABASE_URL` → refuse to start.
+- Boolean flags (`MAIL_TRANSPORT_V1_ENABLED`, `TRANSPORT_GLOBAL_KILL_SWITCH`)
+  accept **exactly** `1`/`true`/`0`/`false`; anything else (`yes`, `on`,
+  `TRUE `, typos) → refuse to start. A kill switch can never be silently
+  disengaged by an unrecognized token.
 - Flag on but no keyring, a non-32-byte key, or an active version absent from
   the keyring → refuse to start.
 - Invalid `LOG_LEVEL` or non-positive numeric setting → refuse to start.
