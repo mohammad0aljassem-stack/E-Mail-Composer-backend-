@@ -120,6 +120,9 @@ describe("MutationExecutor", () => {
     expect(h.audit.events.some((e) => e.eventType === "mutation_applied")).toBe(
       true,
     );
+    // C1 (Phase 3B): a mutation uses an IMAP session ONLY — no SMTP submission.
+    expect(h.factory.imapSessionsCreated).toBeGreaterThanOrEqual(1);
+    expect(h.factory.submissionsCreated).toBe(0);
   });
 
   // C6: the global kill switch skips content-free with ZERO IMAP connects.
@@ -135,7 +138,8 @@ describe("MutationExecutor", () => {
         flags: ["\\Seen"],
       },
     });
-    expect(h.factory.createdCount).toBe(0); // no provider, no IMAP connect
+    expect(h.factory.imapSessionsCreated).toBe(0); // no provider, no IMAP connect
+    expect(h.factory.submissionsCreated).toBe(0);
     expect(
       h.server
         .folder("INBOX")

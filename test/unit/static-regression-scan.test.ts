@@ -177,6 +177,165 @@ describe("B7 — no direct SMTP submission outside the provider adapter", () => 
   });
 });
 
+describe("C1 — SMTP capability is confined to the submission factory path", () => {
+  // The ONLY sanctioned SMTP client construction sites: the adapter itself and
+  // the capability-scoped provider factory (createSubmission).
+  const SMTP_CONSTRUCTION_ALLOWED = new Set<string>([
+    "src/providers/imap-smtp/smtp-client.ts",
+    "src/workers/provider-factory.ts",
+  ]);
+  // Files that must stay free of ANY SMTP-client coupling: the read-only /
+  // mailbox-mutating executors and the durable sync-request dispatcher.
+  const READ_ONLY_MODULES = [
+    "src/workers/sync-executor.ts",
+    "src/workers/mutation-executor.ts",
+    "src/workers/draft-mirror-executor.ts",
+    "src/workers/draft-mirror-payload-resolver.ts",
+    "src/workers/send-payload-resolver.ts",
+    "src/workers/sync-request-dispatcher.ts",
+    "src/workers/idle-coordinator.ts",
+  ];
+
+  it("SMTP client construction happens only in the allowlisted files", () => {
+    const construction =
+      /new\s+NodemailerSmtpClient\b|nodemailer\.createTransport\s*\(/;
+    for (const rel of walk("src", [".ts"])) {
+      if (SMTP_CONSTRUCTION_ALLOWED.has(rel)) continue;
+      const code = codeLines(read(rel)).join("\n");
+      expect(
+        construction.test(code),
+        `SMTP client construction outside the factory in ${rel}`,
+      ).toBe(false);
+    }
+  });
+
+  it("no combined verifyConnection() call site remains anywhere", () => {
+    // The combined IMAP+SMTP verify was removed with the capability split; a
+    // reappearance would mean read paths verify SMTP again. The pattern is
+    // assembled at runtime so this scan file never matches itself.
+    const combined = new RegExp("verifyConnection" + "\\s*\\(");
+    for (const rel of [...walk("src", [".ts"]), ...walk("test", [".ts"])]) {
+      if (rel === "test/unit/static-regression-scan.test.ts") continue;
+      expect(
+        combined.test(read(rel)),
+        `combined verifyConnection call/definition in ${rel}`,
+      ).toBe(false);
+    }
+  });
+
+  it("read-only executor modules never touch the SMTP client module", () => {
+    const banned = /NodemailerSmtpClient|smtp-client|createSubmission/;
+    for (const rel of READ_ONLY_MODULES) {
+      for (const line of codeLines(read(rel))) {
+        expect(
+          banned.test(line),
+          `SMTP-capability reference in read-only module ${rel}: ${line.trim()}`,
+        ).toBe(false);
+      }
+    }
+  });
+});
+
+describe("Correction 3 — durable multi-batch sync lifecycle invariants", () => {
+  // The false-completion defect: the worker entrypoint used to markCompleted
+  // after the FIRST executor batch. Completion now lives ONLY in the extracted
+  // lifecycle function, which must check needsFollowUp before completing.
+  it("the worker entrypoint never calls markCompleted (lifecycle owns completion)", () => {
+    const code = codeLines(read("src/entrypoints/worker.ts")).join("\n");
+    expect(code.includes("markCompleted")).toBe(false);
+  });
+
+  it("the lifecycle module references needsFollowUp before calling markCompleted", () => {
+    const code = codeLines(read("src/workers/sync-lifecycle.ts")).join("\n");
+    const followUpAt = code.indexOf("needsFollowUp");
+    // The CALL site (`.markCompleted(`) — not the store-interface Pick type.
+    const completedAt = code.indexOf("markCompleted(");
+    expect(followUpAt).toBeGreaterThanOrEqual(0);
+    expect(completedAt).toBeGreaterThanOrEqual(0);
+    expect(followUpAt).toBeLessThan(completedAt);
+  });
+
+  // A continuation must NEVER drop the durable request id (the original defect
+  // enqueued follow-ups via the plain mailbox+folder key, losing the request).
+  it("every continuation enqueue call site passes syncRequestId", () => {
+    const callish = /enqueueSyncContinuation\s*\(|\benqueueContinuation\s*\(/;
+    for (const rel of walk("src", [".ts"])) {
+      // The QueueManager method definition itself derives the key; call sites
+      // elsewhere must pass the id inside the argument object.
+      if (rel === "src/queues/queue-manager.ts") continue;
+      const lines = codeLines(read(rel));
+      for (let i = 0; i < lines.length; i++) {
+        if (!callish.test(lines[i]!)) continue;
+        const window = lines.slice(i, i + 10).join("\n");
+        expect(
+          window.includes("syncRequestId"),
+          `continuation enqueue without syncRequestId in ${rel} near: ${lines[i]!.trim()}`,
+        ).toBe(true);
+      }
+    }
+  });
+});
+
+describe("C4 — the production send-payload resolver is real (no stub)", () => {
+  it('src never reintroduces the throwing "not configured" resolver stub', () => {
+    // Assembled at runtime so this scan file never matches itself.
+    const stub = "send payload resolver" + " not configured";
+    for (const rel of walk("src", [".ts"])) {
+      expect(read(rel).includes(stub), `resolver stub in ${rel}`).toBe(false);
+    }
+  });
+
+  it("the send-executor wiring constructs DraftVersionSendPayloadResolver inside the sendMessage-gated branch", () => {
+    const code = codeLines(read("src/entrypoints/worker.ts")).join("\n");
+    const gate = code.indexOf("if (plan.sendMessage)");
+    const resolver = code.indexOf("new DraftVersionSendPayloadResolver");
+    expect(gate).toBeGreaterThanOrEqual(0);
+    expect(resolver).toBeGreaterThan(gate);
+  });
+});
+
+describe("C6 — draft mirroring registers only behind its capability flag", () => {
+  it("the registration plan gates draftMirror on master && draftMirrorEnabled", () => {
+    const code = read("src/entrypoints/registration-plan.ts");
+    expect(
+      /draftMirror:\s*master\s*&&\s*config\.draftMirrorEnabled/.test(code),
+    ).toBe(true);
+  });
+
+  it("worker.ts registers the draft_mirror handler inside the plan.draftMirror branch", () => {
+    const code = codeLines(read("src/entrypoints/worker.ts")).join("\n");
+    const gate = code.indexOf("if (plan.draftMirror)");
+    const registration = code.indexOf("QUEUE_NAMES.draftMirror");
+    expect(gate).toBeGreaterThanOrEqual(0);
+    expect(registration).toBeGreaterThan(gate);
+  });
+});
+
+describe("C5 — outbound MIME is built once with a pinned date", () => {
+  it("every buildOutboundMime call in the send executor pins a date", () => {
+    const lines = read("src/workers/send-executor.ts").split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      if (!lines[i]!.includes("buildOutboundMime(")) continue;
+      const window = lines.slice(i, i + 4).join("\n");
+      expect(
+        window.includes("date"),
+        `un-pinned buildOutboundMime near send-executor.ts line ${i + 1}`,
+      ).toBe(true);
+    }
+  });
+
+  it("the send MIME path never stamps an ad-hoc bare `new Date()`", () => {
+    for (const rel of [
+      "src/workers/send-executor.ts",
+      "src/mime/outbound-builder.ts",
+    ]) {
+      expect(/new Date\(\)/.test(read(rel)), `bare new Date() in ${rel}`).toBe(
+        false,
+      );
+    }
+  });
+});
+
 describe("B7 — send_message acquires no retry behavior", () => {
   it("the send_message queue block keeps retryLimit 0 / retryBackoff false", () => {
     const src = read("src/queues/queue-config.ts");
@@ -201,6 +360,75 @@ describe("B7 — send_message acquires no retry behavior", () => {
       .filter((l) => !l.trim().startsWith("//"))
       .join("\n");
     expect(code).not.toMatch(/retryLimit\s*:/);
+  });
+});
+
+describe("C7 — the IDLE coordinator is gated and IMAP-only", () => {
+  it("the registration plan gates idle on master && sync && idle", () => {
+    const code = read("src/entrypoints/registration-plan.ts");
+    expect(
+      /idle:\s*master\s*&&\s*config\.syncEnabled\s*&&\s*config\.idleEnabled/.test(
+        code,
+      ),
+    ).toBe(true);
+  });
+
+  it("worker.ts constructs the IdleCoordinator only inside the plan.idle branch", () => {
+    const code = codeLines(read("src/entrypoints/worker.ts")).join("\n");
+    const gate = code.indexOf("if (plan.idle)");
+    const construction = code.indexOf("new IdleCoordinator");
+    expect(gate).toBeGreaterThanOrEqual(0);
+    expect(construction).toBeGreaterThan(gate);
+  });
+
+  it("the coordinator depends only on the createImapSession capability slice", () => {
+    const code = read("src/workers/idle-coordinator.ts");
+    expect(code).toContain('Pick<ProviderFactory, "createImapSession">');
+  });
+});
+
+describe("Phase 3B — no real IONOS hostname in tests", () => {
+  // Assembled at runtime so this scan file never matches itself. The docs
+  // may show provider-shaped host EXAMPLES (docs/env-reference.md); test
+  // code must never name a real IONOS endpoint — tests run against the
+  // in-repo fakes only.
+  const banned = ".io" + "nos.";
+  it("test/ contains no dotted IONOS hostname literal", () => {
+    for (const rel of walk("test", [".ts"])) {
+      expect(
+        read(rel).toLowerCase().includes(banned),
+        `IONOS hostname literal in ${rel}`,
+      ).toBe(false);
+    }
+  });
+});
+
+describe("Phase 3B — the production project ref appears only in its denylist fixtures", () => {
+  // The ONLY sanctioned occurrences: the provisioning CLI (which DEFINES the
+  // refusal denylist), the unit test that asserts the refusal, and this scan.
+  const PROD_REF_FIXTURES = new Set<string>([
+    "src/entrypoints/provision-credential.ts",
+    "test/unit/crypto.test.ts",
+    "test/unit/static-regression-scan.test.ts",
+  ]);
+  const prodRef = "fpanvpxjjddhasjmpflz";
+  it("src/ and test/ never reference the production project ref elsewhere", () => {
+    for (const rel of [...walk("src", [".ts"]), ...walk("test", [".ts"])]) {
+      if (PROD_REF_FIXTURES.has(rel)) continue;
+      expect(
+        read(rel).includes(prodRef),
+        `production project ref in ${rel}`,
+      ).toBe(false);
+    }
+  });
+
+  it("the sanctioned fixtures keep the ref denylisted, not connectable", () => {
+    // The CLI must still define the refusal constant, and the test must
+    // assert refusal — deleting either would silently disarm the tripwire.
+    expect(read("src/entrypoints/provision-credential.ts")).toContain(
+      `PROD_PROJECT_REF = "${prodRef}"`,
+    );
+    expect(read("test/unit/crypto.test.ts")).toContain(prodRef);
   });
 });
 

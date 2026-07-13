@@ -17,6 +17,7 @@ import type {
   FolderRole,
   SendRecipients,
 } from "../domain/models.js";
+import type { BuiltMime } from "../mime/outbound-builder.js";
 
 export const MAIL_PROVIDER_CONTRACT_VERSION = 1 as const;
 
@@ -113,15 +114,23 @@ export interface IdleChange {
 }
 
 /**
- * The MailProvider port. Every method is provider-agnostic; capabilities gate
+ * The IMAP-session port. Every method is provider-agnostic; capabilities gate
  * what the caller may rely on. A single instance corresponds to one mailbox's
- * connection lifecycle.
+ * IMAP connection lifecycle.
+ *
+ * Deliberately EXCLUDES SMTP submission: read-only/mailbox-mutating work
+ * (sync, folder mutation, draft mirror, Sent-copy reconciliation) must never
+ * be able to contact an SMTP server. Submission lives on the separate
+ * SubmissionProvider port below, constructed only by the send path.
  */
-export interface MailProvider {
+export interface ImapSessionProvider {
   readonly capabilities: ProviderCapabilities;
 
-  /** Establish + authenticate; throws provider_auth_failed / provider_connect_failed. */
-  verifyConnection(): Promise<void>;
+  /**
+   * Establish + authenticate the IMAP session; throws provider_auth_failed /
+   * provider_connect_failed. Never touches SMTP.
+   */
+  verifyImap(): Promise<void>;
 
   discoverFolders(): Promise<readonly DiscoveredFolder[]>;
 
@@ -157,8 +166,6 @@ export interface MailProvider {
     mime: Buffer,
   ): Promise<AppendResult>;
 
-  sendMessage(message: OutboundMessage): Promise<SendResult>;
-
   /** Append a copy of a sent message to the Sent folder (idempotent by search). */
   appendSentCopy(folder: string, mime: Buffer): Promise<AppendResult>;
 
@@ -168,6 +175,35 @@ export interface MailProvider {
   applyMutation(mutation: FolderMutation): Promise<void>;
 
   disconnect(): Promise<void>;
+}
+
+/**
+ * The SMTP-submission port. Constructed ONLY by the send executor, AFTER the
+ * sender-authority and payload-integrity guards passed — never by sync,
+ * mutation, draft-mirror, or Sent-copy reconciliation code.
+ */
+export interface SubmissionProvider {
+  /**
+   * Explicit SMTP connection/auth verification. Never invoked implicitly by
+   * construction; the caller decides whether a pre-flight verify is wanted.
+   */
+  verifySmtp(): Promise<void>;
+
+  /**
+   * Submit the message. When `prebuilt` is provided (the send executor's
+   * build-once path, C5), those EXACT bytes go on the wire — no rebuild — so
+   * the SMTP DATA payload and the later Sent-folder copy are byte-identical.
+   */
+  sendMessage(
+    message: OutboundMessage,
+    prebuilt?: BuiltMime,
+  ): Promise<SendResult>;
+
+  /**
+   * Release submission resources (no-op is acceptable for connectionless
+   * per-send clients).
+   */
+  close(): Promise<void>;
 }
 
 export type FolderMutation =

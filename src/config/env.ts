@@ -13,6 +13,19 @@ import { TransportError } from "../domain/errors.js";
 export interface TransportConfig {
   /** Master feature flag. Defaults false → fully fail-closed. */
   readonly transportEnabled: boolean;
+  /**
+   * Sub-capability flags (C2). Every one defaults false and each stored value
+   * is the EFFECTIVE value: a sub-flag is true only when its env var parsed
+   * true AND the master transportEnabled flag is true. A sub-flag set true
+   * with the master off simply fails closed to false (no startup error; the
+   * worker startup log surfaces the effective matrix). These are backend
+   * runtime controls — deliberately NOT part of the UI schema manifest.
+   */
+  readonly syncEnabled: boolean;
+  readonly idleEnabled: boolean;
+  readonly draftMirrorEnabled: boolean;
+  readonly mutationsEnabled: boolean;
+  readonly sendEnabled: boolean;
   /** Least-privilege worker DB connection string. */
   readonly databaseUrl: string;
   /** pg-boss schema (isolates the queue tables). */
@@ -38,6 +51,24 @@ export interface TransportConfig {
   readonly syncClaimBatchSize: number;
   /** Durable sync_requests: hard cap on durable re-claims before failed. */
   readonly syncMaxAttempts: number;
+  /**
+   * Max executor batches run inside ONE sync_mailbox job before the handler
+   * enqueues a cursor-keyed continuation job (bounds job runtime so the pg-boss
+   * expiration + the durable lease renewal cadence stay honest).
+   */
+  readonly syncMaxBatchesPerJob: number;
+  /**
+   * IDLE coordinator (C7): IDLE wait bound per cycle. A silent window
+   * triggers ONE deterministic (deduped) fallback incremental sync.
+   */
+  readonly idleTimeoutMs: number;
+  /** IDLE reconnect backoff bounds (pre-jitter base; ±50% jitter applied). */
+  readonly idleBackoffMinMs: number;
+  readonly idleBackoffMaxMs: number;
+  /** IDLE mailbox-list rescan interval (adopt new / drop disabled). */
+  readonly idleRescanMs: number;
+  /** Global cap on concurrent IDLE sessions (workspace fairness). */
+  readonly idleMaxSessions: number;
 }
 
 /**
@@ -150,6 +181,27 @@ export function loadConfig(
     "MAIL_TRANSPORT_V1_ENABLED",
   );
 
+  // Sub-capability flags (C2): every token is parsed STRICTLY even when the
+  // master flag is off (an invalid token always fails startup), THEN masked by
+  // the master flag — a sub-capability is effective only when the master is
+  // true. sub=true + master=false fails closed to false without throwing.
+  const effective = (raw: boolean): boolean => transportEnabled && raw;
+  const syncEnabled = effective(
+    bool(env.MAIL_SYNC_ENABLED, false, "MAIL_SYNC_ENABLED"),
+  );
+  const idleEnabled = effective(
+    bool(env.MAIL_IDLE_ENABLED, false, "MAIL_IDLE_ENABLED"),
+  );
+  const draftMirrorEnabled = effective(
+    bool(env.MAIL_DRAFT_MIRROR_ENABLED, false, "MAIL_DRAFT_MIRROR_ENABLED"),
+  );
+  const mutationsEnabled = effective(
+    bool(env.MAIL_MUTATIONS_ENABLED, false, "MAIL_MUTATIONS_ENABLED"),
+  );
+  const sendEnabled = effective(
+    bool(env.MAIL_SEND_ENABLED, false, "MAIL_SEND_ENABLED"),
+  );
+
   const databaseUrl = env.DATABASE_URL ?? "";
   if (databaseUrl === "") {
     throw new TransportError("config_invalid", "DATABASE_URL is required");
@@ -171,6 +223,23 @@ export function loadConfig(
     );
   }
 
+  const idleBackoffMinMs = int(
+    env.IDLE_BACKOFF_MIN_MS,
+    5_000,
+    "IDLE_BACKOFF_MIN_MS",
+  );
+  const idleBackoffMaxMs = int(
+    env.IDLE_BACKOFF_MAX_MS,
+    300_000,
+    "IDLE_BACKOFF_MAX_MS",
+  );
+  if (idleBackoffMaxMs < idleBackoffMinMs) {
+    throw new TransportError(
+      "config_invalid",
+      "IDLE_BACKOFF_MAX_MS must be >= IDLE_BACKOFF_MIN_MS",
+    );
+  }
+
   const logLevelRaw = (env.LOG_LEVEL ?? "info").toLowerCase();
   if (!["debug", "info", "warn", "error"].includes(logLevelRaw)) {
     throw new TransportError(
@@ -181,6 +250,11 @@ export function loadConfig(
 
   return {
     transportEnabled,
+    syncEnabled,
+    idleEnabled,
+    draftMirrorEnabled,
+    mutationsEnabled,
+    sendEnabled,
     databaseUrl,
     pgBossSchema: env.PGBOSS_SCHEMA ?? "pgboss",
     credentialKeyring,
@@ -220,5 +294,15 @@ export function loadConfig(
       "SYNC_CLAIM_BATCH_SIZE",
     ),
     syncMaxAttempts: int(env.SYNC_MAX_ATTEMPTS, 5, "SYNC_MAX_ATTEMPTS"),
+    syncMaxBatchesPerJob: int(
+      env.SYNC_MAX_BATCHES_PER_JOB,
+      10,
+      "SYNC_MAX_BATCHES_PER_JOB",
+    ),
+    idleTimeoutMs: int(env.IDLE_TIMEOUT_MS, 300_000, "IDLE_TIMEOUT_MS"),
+    idleBackoffMinMs,
+    idleBackoffMaxMs,
+    idleRescanMs: int(env.IDLE_RESCAN_MS, 60_000, "IDLE_RESCAN_MS"),
+    idleMaxSessions: int(env.IDLE_MAX_SESSIONS, 10, "IDLE_MAX_SESSIONS"),
   };
 }

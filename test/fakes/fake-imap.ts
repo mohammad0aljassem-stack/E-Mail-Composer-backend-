@@ -27,6 +27,9 @@ interface FakeMessage {
   size: bigint;
   internalDate: Date;
   hasAttachments: boolean;
+  /** Exact appended MIME bytes (null for seeded messages) — lets tests byte-
+   *  compare the Sent copy against the SMTP submission (C5 build-once). */
+  raw: Buffer | null;
 }
 
 interface FakeFolder {
@@ -102,6 +105,7 @@ export class FakeImapServer {
       size: input.size ?? 100n,
       internalDate: input.internalDate ?? new Date("2026-01-01T00:00:00Z"),
       hasAttachments: input.hasAttachments ?? false,
+      raw: input.raw ?? null,
     });
     return uid;
   }
@@ -222,6 +226,7 @@ export class FakeImapClient implements ImapClient {
       size: BigInt(mime.length),
       internalDate: new Date(),
       hasAttachments: false,
+      raw: Buffer.from(mime),
     });
     return Promise.resolve({ uid, uidvalidity: f.uidvalidity });
   }

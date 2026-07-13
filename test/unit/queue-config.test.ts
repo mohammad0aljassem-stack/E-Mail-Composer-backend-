@@ -34,4 +34,17 @@ describe("queue families + policies", () => {
     expect(singletonKeys.draftMirror("d1", "3")).toBe("draft:d1:3");
     expect(singletonKeys.syncMailbox("mb", "INBOX")).toBe("sync:mb:INBOX");
   });
+
+  it("continuation keys are cursor-distinct from the request dispatch key", () => {
+    const dispatch = singletonKeys.syncRequest("r1");
+    const cont = singletonKeys.syncRequestContinuation("r1", "200");
+    expect(dispatch).toBe("sync-req:r1");
+    expect(cont).toBe("sync-req:r1:uid:200");
+    // Never collides with the original dispatch key of the running job...
+    expect(cont).not.toBe(dispatch);
+    // ...deterministic per (request, cursor) so a crash-recovery duplicate
+    // dedups, while a NEW cursor position yields a NEW key.
+    expect(singletonKeys.syncRequestContinuation("r1", "200")).toBe(cont);
+    expect(singletonKeys.syncRequestContinuation("r1", "400")).not.toBe(cont);
+  });
 });

@@ -45,19 +45,26 @@ describe("B4 — the sender-authority guard precedes SMTP on the send path", () 
   // the authored .ts source.
   const ts = readSrc("../../src/workers/send-executor.ts");
 
-  it("has exactly one SMTP submission site (provider.sendMessage)", () => {
-    const matches = ts.match(/provider\.sendMessage\s*\(/g) ?? [];
+  it("has exactly one SMTP submission site (submission.sendMessage)", () => {
+    const matches = ts.match(/\bsubmission\.sendMessage\s*\(/g) ?? [];
     expect(matches.length).toBe(1);
+    // And exactly one submission-channel CONSTRUCTION site (C1): the send
+    // executor is the only caller of createSubmission; reconciliation and the
+    // Sent append use createImapSession only.
+    const constructed = ts.match(/\.createSubmission\s*\(/g) ?? [];
+    expect(constructed.length).toBe(1);
   });
 
-  it("runs checkSenderAuthority BEFORE creating a provider and before deliver()", () => {
+  it("runs checkSenderAuthority BEFORE creating the submission and before deliver()", () => {
     const guard = ts.indexOf("this.checkSenderAuthority(");
-    const create = ts.indexOf("this.deps.providerFactory.create(mailbox)");
+    const create = ts.indexOf(
+      "this.deps.providerFactory.createSubmission(mailbox)",
+    );
     const deliver = ts.indexOf("return await this.deliver(");
     expect(guard).toBeGreaterThan(-1);
     expect(create).toBeGreaterThan(-1);
     expect(deliver).toBeGreaterThan(-1);
-    // Guard call site precedes provider creation, which precedes delivery.
+    // Guard call site precedes submission construction, which precedes delivery.
     expect(guard).toBeLessThan(create);
     expect(create).toBeLessThan(deliver);
   });

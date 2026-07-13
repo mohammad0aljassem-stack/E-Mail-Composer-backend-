@@ -1,5 +1,6 @@
 import type {
   DraftMirrorRow,
+  DraftVersionRow,
   FolderRole,
   MailboxFolderRow,
   MailboxRow,
@@ -86,6 +87,21 @@ export interface DraftMirrorStore {
   }): Promise<DraftMirrorRow>;
 }
 
+/**
+ * SELECT-only lookup of the immutable draft snapshot for an EXACT confirmed
+ * revision (public.draft_versions). Returns the highest version_no when
+ * several snapshots share the same source_revision, and null when no snapshot
+ * exists for that exact revision — the caller must fail CLOSED (checkpoints
+ * are not guaranteed for every revision; a near-miss is never substituted).
+ */
+export interface DraftVersionReader {
+  findDraftVersion(
+    workspaceId: string,
+    draftId: string,
+    sourceRevision: bigint,
+  ): Promise<DraftVersionRow | null>;
+}
+
 export interface SendIntentReader {
   getById(id: string): Promise<SendIntentRow | null>;
 }
@@ -157,6 +173,19 @@ export interface SyncRequestStore {
     leaseCutoff: Date;
     maxAttempts: number;
   }): Promise<SyncRequestRow[]>;
+
+  /**
+   * Fenced lease renewal for an in-flight claim (single-claimant guarantee,
+   * no schema change): a single CAS statement
+   * `UPDATE ... SET claimed_at = now WHERE id AND status = 'claimed' AND
+   * claimed_at = prevClaimedAt RETURNING claimed_at`. Returns the NEW
+   * `claimedAt` (the next fencing token) or null when the lease was lost —
+   * another claimant re-claimed the row (its claimed_at moved) or the request
+   * reached a terminal state. `prevClaimedAt` MUST be the exact Date previously
+   * returned by claimBatch/getById/renewLease (Postgres timestamptz keeps the
+   * millisecond value exactly; never a re-derived timestamp).
+   */
+  renewLease(id: string, prevClaimedAt: Date, now: Date): Promise<Date | null>;
 
   /** Terminal success: `claimed -> completed`, set `completedAt`. Idempotent. */
   markCompleted(id: string, now: Date): Promise<SyncRequestRow | null>;

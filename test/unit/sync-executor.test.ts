@@ -83,6 +83,8 @@ describe("SyncExecutor", () => {
     h.server.seedMessage("INBOX", { messageId: "<m2@x>", subject: "B" });
     const res = await h.exec.execute(initialJob);
     expect(res.persisted).toBe(2);
+    // The result reports the cursor position it just persisted (max UID).
+    expect(res.lastSeenUid).toBe(2n);
     const inbox = await h.folders.getByMailboxAndName(MAILBOX_ID, "INBOX");
     expect(await h.messages.countByFolder(inbox!.id)).toBe(2);
   });
@@ -143,6 +145,7 @@ describe("SyncExecutor", () => {
     expect(res.uidValidityChanged).toBe(true);
     expect(res.needsFollowUp).toBe(true);
     expect(res.persisted).toBe(0); // nothing mixed into the old namespace
+    expect(res.lastSeenUid).toBe(0n); // invalidated cursor is reported as 0n
 
     const inbox = await h.folders.getByMailboxAndName(MAILBOX_ID, "INBOX");
     expect(inbox?.uidvalidity).toBe(20n);
@@ -170,9 +173,33 @@ describe("SyncExecutor", () => {
       persisted: 0,
       uidValidityChanged: false,
       needsFollowUp: false,
+      lastSeenUid: 0n,
     });
-    expect(h.factory.createdCount).toBe(0); // no provider, no IMAP connect
+    expect(h.factory.imapSessionsCreated).toBe(0); // no provider, no IMAP connect
+    expect(h.factory.submissionsCreated).toBe(0);
     expect(h.messages.rows.size).toBe(0);
+  });
+
+  // C1 (Phase 3B): read-only sync constructs an IMAP session ONLY — never an
+  // SMTP submission channel.
+  it("constructs only an IMAP session, never an SMTP submission", async () => {
+    const h = makeHarness();
+    h.server.seedMessage("INBOX", { messageId: "<m1@x>" });
+    await h.exec.execute(initialJob);
+    expect(h.factory.imapSessionsCreated).toBeGreaterThanOrEqual(1);
+    expect(h.factory.submissionsCreated).toBe(0);
+  });
+
+  // C1 (Phase 3B): an IMAP connect failure surfaces the error without any SMTP
+  // construction or verification (SMTP is simply never part of a sync).
+  it("propagates an IMAP connect failure without constructing SMTP", async () => {
+    const h = makeHarness();
+    h.server.connectOk = false;
+    await expect(h.exec.execute(initialJob)).rejects.toBeInstanceOf(
+      TransportError,
+    );
+    expect(h.factory.submissionsCreated).toBe(0);
+    expect(h.factory.smtp.submissions).toHaveLength(0);
   });
 
   // C9: a References header carried by the provider is persisted (threading).
@@ -198,11 +225,15 @@ describe("SyncExecutor", () => {
     const res = await h.exec.execute(incrementalJob);
     expect(res.persisted).toBe(2);
     expect(res.needsFollowUp).toBe(true);
+    // SyncResult.lastSeenUid === the persisted cursor after THIS batch — the
+    // value multi-batch continuation keys are derived from.
+    expect(res.lastSeenUid).toBe(2n);
     const inbox = await h.folders.getByMailboxAndName(MAILBOX_ID, "INBOX");
     expect(inbox?.lastSeenUid).toBe(2n);
     // The follow-up picks up the remainder.
     const res2 = await h.exec.execute(incrementalJob);
     expect(res2.persisted).toBe(1);
+    expect(res2.lastSeenUid).toBe(3n);
     expect(
       (await h.folders.getByMailboxAndName(MAILBOX_ID, "INBOX"))?.lastSeenUid,
     ).toBe(3n);
@@ -223,6 +254,7 @@ describe("enqueueSyncFollowUp (sync_mailbox handler)", () => {
     persisted: 0,
     uidValidityChanged: false,
     needsFollowUp,
+    lastSeenUid: 0n,
   });
 
   it("enqueues exactly one incremental follow-up when needsFollowUp is true", async () => {
@@ -270,7 +302,7 @@ describe("IMAP IDLE wake-up", () => {
     server.addFolder({ name: "INBOX", role: "inbox" });
     server.queueIdleSignal("INBOX", { kind: "exists" });
     const factory = new FakeProviderFactory(server, new FakeSmtpClient());
-    const provider = await factory.create(sendableMailbox());
+    const provider = await factory.createImapSession(sendableMailbox());
     const change = await provider.waitForChanges("INBOX", 1000);
     expect(change?.kind).toBe("exists");
     // A timeout with no signal returns null (bounded periodic fallback).

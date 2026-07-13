@@ -18,33 +18,91 @@ import type { SyncMailboxJob } from "../queues/queue-config.js";
  * with a DETERMINISTIC key derived from the durable request id. It never polls
  * transport_audit (that is not a queue) and never creates pg-boss jobs from SQL.
  *
- * STATE FLOW (durable row):
- *   pending --claim--> claimed --success--> completed
- *                          \---terminal fail / exhausted--> failed
+ * STATE DIAGRAM (durable row):
+ *
+ *   pending --claimBatch--> claimed --final batch (needsFollowUp=false)--> completed
+ *      ^                     |  ^ \
+ *      |                     |  |  \--terminal fail (final pg-boss attempt)
+ *      (RPC insert only)     |  |      or reapExhausted / unsyncable--> failed
+ *                            |  |
+ *                            |  renewLease CAS (in-job, between batches)
+ *                            |  and cursor-keyed CONTINUATION jobs — the row
+ *                            |  STAYS 'claimed' across both (no state change,
+ *                            |  no attempt_count change)
+ *                            |
+ *                            stale lease (claimed_at < now - leaseMs)
+ *                            --claimBatch reclaim (attempt_count += 1)--> claimed
  *
  *   * A claim is a single atomic statement (see SyncRequestStore.claimBatch):
  *     `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED LIMIT n)`.
  *     Exactly one worker claims any one row; two-worker races resolve to one.
  *   * On claim: status='claimed', claimed_at=now(), attempt_count += 1.
  *     attempt_count increments ONLY on a durable (re)claim — never per pg-boss
- *     retry (see LEASE / ATTEMPTS below).
- *   * completed_at is set only when markCompleted runs (claimed -> completed).
- *     claimed_at is written on every claim and is intentionally NOT nulled on
- *     completion/failure (it is the last-claim timestamp, retained for audit).
+ *     retry, never per lease renewal, never per continuation job.
+ *   * completed_at is set only when markCompleted runs (claimed -> completed;
+ *     status-guarded, so completion is monotonic and terminal). claimed_at is
+ *     written on every claim and renewed by every in-job renewLease CAS; it is
+ *     intentionally NOT nulled on completion/failure (last-claim timestamp,
+ *     retained for audit).
  *
- * LEASE + STALE DETECTION (crash recovery):
- *   A `claimed` row whose claimed_at is older than `leaseMs` is STALE: the
- *   claiming worker is presumed dead (crash-after-claim-before-enqueue, or a
- *   pod restart mid-flight). It becomes reclaimable on the next pass — a FRESH
- *   claim (recent claimed_at) is never stolen. Recommended leaseMs is a few
- *   minutes: comfortably longer than a healthy dispatch + enqueue, shorter than
- *   an operator's patience for a stuck request.
+ * IN-JOB BATCH LOOP + LEASE RENEWAL FENCING (see workers/sync-lifecycle.ts):
+ *   The sync_mailbox handler runs up to SYNC_MAX_BATCHES_PER_JOB executor
+ *   batches inside ONE job. Between batches it renews the durable lease with a
+ *   fenced CAS: `UPDATE ... SET claimed_at=now WHERE id AND status='claimed'
+ *   AND claimed_at=<the exact Date the claimant holds>`. The claimed_at value
+ *   is the fencing token — a reclaim moves it, so a stale claimant's next CAS
+ *   fails (null) and it stops WITHOUT marking anything. At most one claimant
+ *   is ever effective, with no schema change.
+ *
+ * CONTINUATION KEY (multi-batch backlog beyond the in-job bound):
+ *   When the bound is hit while needsFollowUp is still true, the handler
+ *   enqueues a continuation job that carries the SAME syncRequestId (every
+ *   continuation stays associated with the original durable request) under
+ *   singletonKey `sync-req:{id}:uid:{cursorUid}` (cursorUid = the folder
+ *   cursor's lastSeenUid after the last completed batch). The key is
+ *   cursor-distinct: it can NEVER collide with the original `sync-req:{id}`
+ *   dispatch key, and a crash-recovery duplicate of the same continuation
+ *   produces the SAME key.
+ *
+ * NULL-ENQUEUE BEHAVIOR (pg-boss singleton semantics):
+ *   boss.send returns null when a job with the same singletonKey is already
+ *   queued. For the deterministic keys above, null therefore PROVES an
+ *   identical-work job already exists: dispatch treats it as dispatched, and
+ *   the continuation path logs content-free `sync_continuation_dedup` and
+ *   treats it as success. An enqueue THROW (not null) marks nothing — the
+ *   request stays 'claimed' and the stale-lease reclaim re-drives it.
+ *
+ * CRASH WINDOWS (each is safe):
+ *   * Before/during the first batch: nothing (or a partial batch) persisted,
+ *     cursor NOT advanced past durable rows. Lease expires -> reclaim
+ *     (attempt_count+1) -> re-run. The (folder,uidvalidity,uid) upsert is
+ *     idempotent, so re-fetched messages never duplicate.
+ *   * Mid-loop after a batch persisted (cursor advanced, before/after a
+ *     renewal): request stays 'claimed'; reclaim re-runs incrementally from
+ *     the monotonic cursor — no loss, no duplicates.
+ *   * After the continuation enqueue, before the job acks: a pg-boss retry (or
+ *     a reclaim) re-runs the loop idempotently and re-enqueues the SAME
+ *     cursor-distinct key -> null -> dedup. No lost work, no duplicate job.
+ *   * After the final batch, before markCompleted: request stays 'claimed';
+ *     reclaim re-runs one incremental batch that finds nothing new
+ *     (needsFollowUp=false) -> markCompleted. Bounded by attempt_count.
+ *
+ * DUPLICATE DISPATCH:
+ *   A reclaim re-enqueues under the original deterministic `sync-req:{id}` key;
+ *   while a queued (created-state) job holds that key the re-enqueue dedups to
+ *   null. If a reclaimed dispatch job and a still-running (or continuation)
+ *   job momentarily coexist, the renewLease CAS guarantees only ONE of them
+ *   remains effective — the loser stops without marking anything.
  *
  * MAX ATTEMPTS + interaction with sync_mailbox.retryLimit=5:
  *   Two INDEPENDENT layers that MUST NOT multiply into an undocumented count:
  *     - pg-boss retryLimit=5 retries the *executed job* for transient IMAP
  *       errors WITHIN a single durable claim. These do NOT touch attempt_count.
  *     - the durable attempt_count bounds *re-dispatch* (crash / lease expiry).
+ *   Continuation jobs bypass claimBatch entirely (the request stays 'claimed';
+ *   they renew the lease via the CAS using the claimed_at they read at start),
+ *   so continuations NEVER consume the failure budget: attempt_count grows
+ *   only via dispatcher reclaims (crash / lease expiry) — bounded as before.
  *   In the absence of crashes a request is claimed ONCE and enqueued ONCE, so
  *   the execution count is bounded by 5 (pg-boss) — not maxAttempts × 5. A clean
  *   job failure is terminal (markFailed -> 'failed'); it is NOT re-dispatched.

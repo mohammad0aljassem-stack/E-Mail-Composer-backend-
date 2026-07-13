@@ -1,14 +1,16 @@
 import { buildOutboundMime } from "../../mime/outbound-builder.js";
+import type { BuiltMime } from "../../mime/outbound-builder.js";
 import type {
   AppendResult,
   DiscoveredFolder,
   FetchedMessageMeta,
   FolderMutation,
   IdleChange,
-  MailProvider,
+  ImapSessionProvider,
   OutboundMessage,
   ProviderCapabilities,
   SendResult,
+  SubmissionProvider,
   SyncCursor,
   SynchronizeResult,
 } from "../mail-provider.js";
@@ -16,12 +18,17 @@ import { MAIL_PROVIDER_CONTRACT_VERSION } from "../mail-provider.js";
 import type { ImapClient, ImapFetchedMessage, SmtpClient } from "./ports.js";
 
 /**
- * IONOS-style IMAP + SMTP provider.
+ * IONOS-style IMAP session (ImapSmtpProvider) + SMTP submission
+ * (SmtpSubmission), capability-scoped.
  *
  * Built on the ImapClient/SmtpClient ports (ImapFlow + Nodemailer in prod;
  * in-repo fakes in tests). Deliberately NOT Gmail/Graph-shaped: no server-side
  * threads, no client-chosen UIDs, IMAP APPEND assigns a fresh UID. Draft
  * replacement is append-then-retire because IMAP cannot update in place.
+ *
+ * The IMAP session and the SMTP submission are SEPARATE objects over separate
+ * clients so read-only work (sync, mutation, draft mirror, Sent-copy
+ * reconciliation) can never carry SMTP capability.
  */
 export const IMAP_SMTP_CAPABILITIES: ProviderCapabilities = {
   contractVersion: MAIL_PROVIDER_CONTRACT_VERSION,
@@ -50,19 +57,16 @@ function toMeta(m: ImapFetchedMessage): FetchedMessageMeta {
   };
 }
 
-export class ImapSmtpProvider implements MailProvider {
+export class ImapSmtpProvider implements ImapSessionProvider {
   public readonly capabilities = IMAP_SMTP_CAPABILITIES;
   private readonly imap: ImapClient;
-  private readonly smtp: SmtpClient;
 
-  public constructor(deps: { imap: ImapClient; smtp: SmtpClient }) {
+  public constructor(deps: { imap: ImapClient }) {
     this.imap = deps.imap;
-    this.smtp = deps.smtp;
   }
 
-  public async verifyConnection(): Promise<void> {
+  public async verifyImap(): Promise<void> {
     await this.imap.connect();
-    await this.smtp.verify();
   }
 
   public async discoverFolders(): Promise<readonly DiscoveredFolder[]> {
@@ -178,27 +182,6 @@ export class ImapSmtpProvider implements MailProvider {
     return appended;
   }
 
-  public async sendMessage(message: OutboundMessage): Promise<SendResult> {
-    const built = await buildOutboundMime(message);
-    const envelopeTo = [
-      ...message.recipients.to,
-      ...(message.recipients.cc ?? []),
-      ...(message.recipients.bcc ?? []),
-    ];
-    const result = await this.smtp.send({
-      messageId: message.messageId,
-      envelopeFrom: message.sender,
-      envelopeTo,
-      raw: built.raw,
-    });
-    return {
-      messageId: message.messageId,
-      response: result.response,
-      accepted: result.accepted,
-      rejected: result.rejected,
-    };
-  }
-
   public async appendSentCopy(
     folder: string,
     mime: Buffer,
@@ -237,6 +220,55 @@ export class ImapSmtpProvider implements MailProvider {
 
   public async disconnect(): Promise<void> {
     await this.imap.logout();
+  }
+}
+
+/**
+ * SMTP submission channel over the SmtpClient port. Constructed ONLY via
+ * ProviderFactory.createSubmission — i.e. only by the send executor after its
+ * sender-authority + payload-integrity guards. verifySmtp() is explicit and
+ * never runs implicitly on construction.
+ */
+export class SmtpSubmission implements SubmissionProvider {
+  private readonly smtp: SmtpClient;
+
+  public constructor(deps: { smtp: SmtpClient }) {
+    this.smtp = deps.smtp;
+  }
+
+  public async verifySmtp(): Promise<void> {
+    await this.smtp.verify();
+  }
+
+  public async sendMessage(
+    message: OutboundMessage,
+    prebuilt?: BuiltMime,
+  ): Promise<SendResult> {
+    // C5: the send executor builds the MIME exactly once (pinned Date) and
+    // passes it here so the submitted bytes are the SAME Buffer later
+    // appended to Sent. The fallback build exists only for callers outside
+    // the executor path (none in production today).
+    const built = prebuilt ?? (await buildOutboundMime(message));
+    const envelopeTo = [
+      ...message.recipients.to,
+      ...(message.recipients.cc ?? []),
+      ...(message.recipients.bcc ?? []),
+    ];
+    const result = await this.smtp.send({
+      messageId: message.messageId,
+      envelopeFrom: message.sender,
+      envelopeTo,
+      raw: built.raw,
+    });
+    return {
+      messageId: message.messageId,
+      response: result.response,
+      accepted: result.accepted,
+      rejected: result.rejected,
+    };
+  }
+
+  public async close(): Promise<void> {
     await this.smtp.close();
   }
 }

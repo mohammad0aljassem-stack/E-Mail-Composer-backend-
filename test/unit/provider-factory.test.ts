@@ -9,8 +9,10 @@ import { sendableMailbox } from "../helpers/send-fixtures.js";
  * C2 — the production ProviderFactory must NEVER build a plaintext transport
  * session. A mailbox row whose imap_security or smtp_security is 'none' (or
  * unset) is rejected fail-closed with config_invalid BEFORE any credential is
- * read or decrypted. 'ssl' passes the security gate (proven here by reaching
- * the subsequent credential_missing check — no network is ever touched).
+ * read or decrypted — by BOTH capability-scoped methods (config integrity is
+ * checked as a whole even for the protocol a method does not construct).
+ * 'ssl' passes the security gate (proven here by reaching the subsequent
+ * credential_missing check — no network is ever touched).
  */
 
 function makeFactory(): ImapSmtpProviderFactory {
@@ -34,25 +36,39 @@ async function codeOf(promise: Promise<unknown>): Promise<string> {
 }
 
 describe("ImapSmtpProviderFactory — plaintext transport is refused (C2)", () => {
-  it("rejects imap_security = 'none' with config_invalid", async () => {
+  it("rejects imap_security = 'none' with config_invalid (both methods)", async () => {
     const factory = makeFactory();
     const mailbox = sendableMailbox({ imapSecurity: "none" });
-    expect(await codeOf(factory.create(mailbox))).toBe("config_invalid");
+    expect(await codeOf(factory.createImapSession(mailbox))).toBe(
+      "config_invalid",
+    );
+    expect(await codeOf(factory.createSubmission(mailbox))).toBe(
+      "config_invalid",
+    );
   });
 
-  it("rejects smtp_security = 'none' with config_invalid", async () => {
+  it("rejects smtp_security = 'none' with config_invalid (both methods)", async () => {
     const factory = makeFactory();
     const mailbox = sendableMailbox({ smtpSecurity: "none" });
-    expect(await codeOf(factory.create(mailbox))).toBe("config_invalid");
+    expect(await codeOf(factory.createImapSession(mailbox))).toBe(
+      "config_invalid",
+    );
+    expect(await codeOf(factory.createSubmission(mailbox))).toBe(
+      "config_invalid",
+    );
   });
 
   it("rejects a null imap_security / smtp_security (fail-closed)", async () => {
     const factory = makeFactory();
     expect(
-      await codeOf(factory.create(sendableMailbox({ imapSecurity: null }))),
+      await codeOf(
+        factory.createImapSession(sendableMailbox({ imapSecurity: null })),
+      ),
     ).toBe("config_invalid");
     expect(
-      await codeOf(factory.create(sendableMailbox({ smtpSecurity: null }))),
+      await codeOf(
+        factory.createSubmission(sendableMailbox({ smtpSecurity: null })),
+      ),
     ).toBe("config_invalid");
   });
 
@@ -60,8 +76,11 @@ describe("ImapSmtpProviderFactory — plaintext transport is refused (C2)", () =
     const factory = makeFactory();
     // Both securities are 'ssl' in the fixture. With no active credential the
     // NEXT check fires — proving the security gate accepted the config and
-    // that no plaintext (or any) connection was attempted.
-    expect(await codeOf(factory.create(sendableMailbox()))).toBe(
+    // that no plaintext (or any) connection was attempted, on BOTH methods.
+    expect(await codeOf(factory.createImapSession(sendableMailbox()))).toBe(
+      "credential_missing",
+    );
+    expect(await codeOf(factory.createSubmission(sendableMailbox()))).toBe(
       "credential_missing",
     );
   });

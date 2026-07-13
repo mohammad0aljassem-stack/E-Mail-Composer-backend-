@@ -1,7 +1,8 @@
 import type { SendIntentRow } from "../domain/models.js";
 import type {
-  MailProvider,
+  ImapSessionProvider,
   OutboundMessage,
+  SubmissionProvider,
 } from "../providers/mail-provider.js";
 import type { MailboxRow } from "../domain/models.js";
 
@@ -10,13 +11,24 @@ import type { MailboxRow } from "../domain/models.js";
  * assembly are all swappable in tests.
  */
 
-/** Builds a connected MailProvider for a mailbox (resolves + decrypts creds). */
+/**
+ * Capability-scoped provider factory. Each method resolves + decrypts the
+ * mailbox credential (worker-only) and constructs ONLY the protocol client the
+ * capability needs — a read-only sync can never contact SMTP.
+ */
 export interface ProviderFactory {
   /**
-   * Only ever called when the transport feature flag is ON. Resolves the active
-   * credential, decrypts it (worker-only), and returns a connected provider.
+   * Build a connected, IMAP-verified session. Only ever called when the
+   * relevant transport capability flag is ON. NEVER constructs an SMTP client.
    */
-  create(mailbox: MailboxRow): Promise<MailProvider>;
+  createImapSession(mailbox: MailboxRow): Promise<ImapSessionProvider>;
+
+  /**
+   * Build an SMTP submission channel. Called ONLY by the send executor AFTER
+   * its sender-authority + payload-integrity guards passed. Does NOT
+   * auto-verify — the executor decides; construction opens no connection.
+   */
+  createSubmission(mailbox: MailboxRow): Promise<SubmissionProvider>;
 }
 
 /**

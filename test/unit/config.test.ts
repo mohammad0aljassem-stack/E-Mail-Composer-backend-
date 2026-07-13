@@ -62,6 +62,80 @@ describe("env config (fail-closed)", () => {
   });
 });
 
+describe("capability flags (fail-closed, Phase 3B C2)", () => {
+  const base = { DATABASE_URL: "postgres://localhost/db" };
+  const masterOn = {
+    ...base,
+    MAIL_TRANSPORT_V1_ENABLED: "true",
+    CREDENTIAL_KEYRING: `1:${key32}`,
+    CREDENTIAL_ACTIVE_KEY_VERSION: "1",
+  };
+  const FLAG_NAMES = [
+    "MAIL_SYNC_ENABLED",
+    "MAIL_IDLE_ENABLED",
+    "MAIL_DRAFT_MIRROR_ENABLED",
+    "MAIL_MUTATIONS_ENABLED",
+    "MAIL_SEND_ENABLED",
+  ] as const;
+
+  it("every sub-capability flag defaults to false (master on)", () => {
+    const cfg = loadConfig(masterOn);
+    expect(cfg.syncEnabled).toBe(false);
+    expect(cfg.idleEnabled).toBe(false);
+    expect(cfg.draftMirrorEnabled).toBe(false);
+    expect(cfg.mutationsEnabled).toBe(false);
+    expect(cfg.sendEnabled).toBe(false);
+  });
+
+  it("a sub-flag true with the master off yields effective false, no throw", () => {
+    const cfg = loadConfig({
+      ...base,
+      MAIL_SYNC_ENABLED: "true",
+      MAIL_IDLE_ENABLED: "1",
+      MAIL_DRAFT_MIRROR_ENABLED: "true",
+      MAIL_MUTATIONS_ENABLED: "1",
+      MAIL_SEND_ENABLED: "true",
+    });
+    expect(cfg.transportEnabled).toBe(false);
+    expect(cfg.syncEnabled).toBe(false);
+    expect(cfg.idleEnabled).toBe(false);
+    expect(cfg.draftMirrorEnabled).toBe(false);
+    expect(cfg.mutationsEnabled).toBe(false);
+    expect(cfg.sendEnabled).toBe(false);
+  });
+
+  it("a sub-flag is effective only when master AND sub are true (Gate F)", () => {
+    const cfg = loadConfig({ ...masterOn, MAIL_SYNC_ENABLED: "true" });
+    expect(cfg.syncEnabled).toBe(true);
+    // Every other capability stays off.
+    expect(cfg.idleEnabled).toBe(false);
+    expect(cfg.draftMirrorEnabled).toBe(false);
+    expect(cfg.mutationsEnabled).toBe(false);
+    expect(cfg.sendEnabled).toBe(false);
+  });
+
+  it.each(FLAG_NAMES)(
+    "rejects an invalid token for %s even when the master flag is off",
+    (name) => {
+      expect(() => loadConfig({ ...base, [name]: "yes" })).toThrow(
+        TransportError,
+      );
+      expect(() => loadConfig({ ...base, [name]: "on" })).toThrow(
+        TransportError,
+      );
+    },
+  );
+
+  it.each(FLAG_NAMES)("applies the false default for empty %s", (name) => {
+    const cfg = loadConfig({ ...masterOn, [name]: "" });
+    expect(cfg.syncEnabled).toBe(false);
+    expect(cfg.idleEnabled).toBe(false);
+    expect(cfg.draftMirrorEnabled).toBe(false);
+    expect(cfg.mutationsEnabled).toBe(false);
+    expect(cfg.sendEnabled).toBe(false);
+  });
+});
+
 describe("strict boolean env parsing (C5)", () => {
   const base = { DATABASE_URL: "postgres://localhost/db" };
 
@@ -109,5 +183,82 @@ describe("strict boolean env parsing (C5)", () => {
       loadConfig({ ...base, TRANSPORT_GLOBAL_KILL_SWITCH: "" })
         .globalKillSwitch,
     ).toBe(false);
+  });
+});
+
+describe("SYNC_MAX_BATCHES_PER_JOB (durable multi-batch loop bound)", () => {
+  const base = { DATABASE_URL: "postgres://localhost/db" };
+
+  it("defaults to 10", () => {
+    expect(loadConfig(base).syncMaxBatchesPerJob).toBe(10);
+    expect(
+      loadConfig({ ...base, SYNC_MAX_BATCHES_PER_JOB: "" })
+        .syncMaxBatchesPerJob,
+    ).toBe(10);
+  });
+
+  it("accepts a positive integer", () => {
+    expect(
+      loadConfig({ ...base, SYNC_MAX_BATCHES_PER_JOB: "1" })
+        .syncMaxBatchesPerJob,
+    ).toBe(1);
+  });
+
+  it.each(["0", "-1", "2.5", "ten", "1e2x"])(
+    "rejects %j via the strict int parser (must be >= 1)",
+    (value) => {
+      expect(() =>
+        loadConfig({ ...base, SYNC_MAX_BATCHES_PER_JOB: value }),
+      ).toThrow(TransportError);
+    },
+  );
+});
+
+describe("IDLE coordinator settings (C7)", () => {
+  const base = { DATABASE_URL: "postgres://localhost/db" };
+
+  it("applies the documented defaults", () => {
+    const cfg = loadConfig(base);
+    expect(cfg.idleTimeoutMs).toBe(300_000);
+    expect(cfg.idleBackoffMinMs).toBe(5_000);
+    expect(cfg.idleBackoffMaxMs).toBe(300_000);
+    expect(cfg.idleRescanMs).toBe(60_000);
+    expect(cfg.idleMaxSessions).toBe(10);
+  });
+
+  it("accepts explicit positive integers", () => {
+    const cfg = loadConfig({
+      ...base,
+      IDLE_TIMEOUT_MS: "60000",
+      IDLE_BACKOFF_MIN_MS: "1000",
+      IDLE_BACKOFF_MAX_MS: "30000",
+      IDLE_RESCAN_MS: "5000",
+      IDLE_MAX_SESSIONS: "2",
+    });
+    expect(cfg.idleTimeoutMs).toBe(60_000);
+    expect(cfg.idleBackoffMinMs).toBe(1_000);
+    expect(cfg.idleBackoffMaxMs).toBe(30_000);
+    expect(cfg.idleRescanMs).toBe(5_000);
+    expect(cfg.idleMaxSessions).toBe(2);
+  });
+
+  it("rejects an inverted backoff window (max < min) at startup", () => {
+    expect(() =>
+      loadConfig({
+        ...base,
+        IDLE_BACKOFF_MIN_MS: "10000",
+        IDLE_BACKOFF_MAX_MS: "5000",
+      }),
+    ).toThrow(TransportError);
+  });
+
+  it.each([
+    "IDLE_TIMEOUT_MS",
+    "IDLE_BACKOFF_MIN_MS",
+    "IDLE_BACKOFF_MAX_MS",
+    "IDLE_RESCAN_MS",
+    "IDLE_MAX_SESSIONS",
+  ])("rejects a non-positive %s via the strict int parser", (name) => {
+    expect(() => loadConfig({ ...base, [name]: "0" })).toThrow(TransportError);
   });
 });
