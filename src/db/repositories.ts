@@ -1,5 +1,6 @@
 import type {
   DraftMirrorRow,
+  DraftVersionRow,
   MailboxFolderRow,
   MailboxRow,
   MailMessageMeta,
@@ -13,6 +14,7 @@ import type {
   AuditWriter,
   CredentialReader,
   DraftMirrorStore,
+  DraftVersionReader,
   FolderStore,
   HeartbeatWriter,
   MailboxReader,
@@ -383,6 +385,53 @@ export class DraftMirrorRepository implements DraftMirrorStore {
       remoteUidvalidity: b(row.remote_uidvalidity),
       mirroredRevision: b(row.mirrored_revision),
       status: row.status as DraftMirrorRow["status"],
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Draft versions (immutable snapshots; SELECT only — never written here)
+// ---------------------------------------------------------------------------
+/**
+ * SELECT-only reader over public.draft_versions for the EXACT confirmed
+ * source_revision. NOTE (deployment gap, fail-closed by design): the canonical
+ * migrations grant transport_worker NO privilege on public.draft_versions
+ * (see the 20260713100000 grant block — mailboxes/send_intents/... only), so
+ * under the real worker role this SELECT raises and the payload resolver fails
+ * CLOSED with the content-free code `draft_version_unreadable`. Enabling
+ * MAIL_SEND_ENABLED in a real environment therefore requires a FUTURE additive
+ * UI-owned grant migration (SELECT on public.draft_versions to
+ * transport_worker). No grant is added anywhere in this repo — not even in
+ * test SQL; the integration suite asserts the denial instead.
+ */
+export class DraftVersionRepository implements DraftVersionReader {
+  public constructor(private readonly db: Queryable) {}
+
+  public async findDraftVersion(
+    workspaceId: string,
+    draftId: string,
+    sourceRevision: bigint,
+  ): Promise<DraftVersionRow | null> {
+    const r = await this.db.query(
+      `select id, workspace_id, draft_id, version_no, source_revision,
+              subject, body_json, created_at
+         from public.draft_versions
+        where workspace_id = $1 and draft_id = $2 and source_revision = $3
+        order by version_no desc
+        limit 1`,
+      [workspaceId, draftId, sourceRevision.toString()],
+    );
+    const row = r.rows[0];
+    if (row === undefined) return null;
+    return {
+      id: row.id as string,
+      workspaceId: row.workspace_id as string,
+      draftId: row.draft_id as string,
+      versionNo: req(row.version_no),
+      sourceRevision: req(row.source_revision),
+      subject: row.subject as string,
+      bodyJson: row.body_json,
+      createdAt: new Date(row.created_at as string),
     };
   }
 }

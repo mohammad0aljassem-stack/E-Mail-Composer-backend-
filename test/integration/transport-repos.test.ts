@@ -5,13 +5,22 @@ import { recomputeConfirmationProof } from "../../src/domain/confirmation-proof.
 import type { SendIntentRow } from "../../src/domain/models.js";
 import {
   DraftMirrorRepository,
+  DraftVersionRepository,
   FolderRepository,
   MessageRepository,
   SendAttemptRepository,
   WorkerClaimRepository,
 } from "../../src/db/repositories.js";
 import { PgDatabase } from "../../src/db/pool.js";
-import { HAS_DB, seedContext, superuserPool, WORKER_URL } from "./helpers.js";
+import { renderDraftBody } from "../../src/mime/draft-renderer.js";
+import { DraftVersionSendPayloadResolver } from "../../src/workers/send-payload-resolver.js";
+import {
+  HAS_DB,
+  seedContext,
+  superuserPool,
+  SUPERUSER_URL,
+  WORKER_URL,
+} from "./helpers.js";
 
 const d = HAS_DB ? describe : describe.skip;
 
@@ -233,6 +242,129 @@ d("message dedupe + draft mirror guard (real DB)", () => {
       status: "mirrored",
     });
     expect(after.mirroredRevision).toBe(3n); // unchanged
+  });
+});
+
+d("draft_versions snapshot access (Phase 3B C4, real grants)", () => {
+  let admin: pg.Pool;
+  let adminDb: PgDatabase;
+  let worker: PgDatabase;
+  beforeAll(() => {
+    admin = superuserPool();
+    adminDb = new PgDatabase({ connectionString: SUPERUSER_URL });
+    worker = new PgDatabase({ connectionString: WORKER_URL });
+  });
+  afterAll(async () => {
+    await worker.end();
+    await adminDb.end();
+    await admin.end();
+  });
+
+  const SNAPSHOT_DOC = {
+    type: "doc",
+    content: [
+      {
+        type: "paragraph",
+        content: [{ type: "text", text: "integration snapshot body" }],
+      },
+    ],
+  };
+
+  async function seedVersion(ctx: {
+    workspaceId: string;
+    draftId: string;
+    userId: string;
+  }): Promise<void> {
+    await admin.query(
+      `insert into public.draft_versions
+         (workspace_id, draft_id, version_no, source_revision, subject,
+          body_json, reason, created_by)
+       values ($1,$2,1,1,'subject',$3::jsonb,'manual_checkpoint',$4)`,
+      [ctx.workspaceId, ctx.draftId, JSON.stringify(SNAPSHOT_DOC), ctx.userId],
+    );
+  }
+
+  function intentFor(ctx: {
+    workspaceId: string;
+    mailboxId: string;
+    draftId: string;
+    userId: string;
+  }): SendIntentRow {
+    return {
+      id: randomUUID(),
+      workspaceId: ctx.workspaceId,
+      mailboxId: ctx.mailboxId,
+      draftId: ctx.draftId,
+      draftRevision: 1n,
+      sender: "sender@test.local",
+      recipients: { to: ["r@test.local"] },
+      subject: "subject",
+      htmlHash: null,
+      textHash: null,
+      attachmentManifest: [],
+      messageId: messageId(),
+      idempotencyKey: `idem-${randomUUID()}`,
+      templateVersionId: null,
+      signatureId: null,
+      confirmedBy: ctx.userId,
+      confirmationProof: "a".repeat(64),
+      contractVersion: 1,
+    };
+  }
+
+  // DECISION PROBE: the canonical migrations grant transport_worker NO
+  // privilege on public.draft_versions (foundation grant block: mailboxes,
+  // send_intents, ... — draft_versions absent). Until a FUTURE additive
+  // UI-owned grant migration lands, the worker role cannot read snapshots and
+  // MAIL_SEND_ENABLED cannot deliver in a real environment. This test pins
+  // that reality; no grant is injected anywhere in this repo.
+  it("transport_worker has NO SELECT on public.draft_versions (42501)", async () => {
+    try {
+      await worker.query(`select id from public.draft_versions limit 1`);
+      expect.unreachable("worker SELECT on draft_versions should be denied");
+    } catch (err) {
+      expect((err as { code?: string }).code).toBe("42501");
+    }
+  });
+
+  it("the resolver fails CLOSED (draft_version_unreadable) under the worker role", async () => {
+    const ctx = await seedContext(admin);
+    await seedVersion(ctx);
+    const resolver = new DraftVersionSendPayloadResolver({
+      draftVersions: new DraftVersionRepository(worker),
+    });
+    await expect(resolver.resolve(intentFor(ctx))).rejects.toMatchObject({
+      name: "TransportError",
+      code: "send_precondition_failed",
+      context: { reason: "draft_version_unreadable" },
+    });
+  });
+
+  it("full resolver round-trip against the real schema via the service path", async () => {
+    // Proves the SELECT shape + jsonb rendering against the canonical schema.
+    // Runs over the superuser connection because the worker role's grant is a
+    // documented follow-up (see the probe above).
+    const ctx = await seedContext(admin);
+    await seedVersion(ctx);
+    const resolver = new DraftVersionSendPayloadResolver({
+      draftVersions: new DraftVersionRepository(adminDb),
+    });
+    const payload = await resolver.resolve(intentFor(ctx));
+    expect(payload.revision).toBe(1n);
+    const rendered = renderDraftBody(SNAPSHOT_DOC);
+    expect(payload.message.html).toBe(rendered.html);
+    expect(payload.message.text).toBe(rendered.text);
+    expect(payload.message.attachments).toEqual([]);
+  });
+
+  it("a missing exact-revision snapshot resolves to fail-closed (service path)", async () => {
+    const ctx = await seedContext(admin); // no draft_versions row seeded
+    const resolver = new DraftVersionSendPayloadResolver({
+      draftVersions: new DraftVersionRepository(adminDb),
+    });
+    await expect(resolver.resolve(intentFor(ctx))).rejects.toMatchObject({
+      context: { reason: "draft_revision_snapshot_missing" },
+    });
   });
 });
 

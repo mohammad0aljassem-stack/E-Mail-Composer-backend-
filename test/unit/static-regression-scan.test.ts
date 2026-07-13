@@ -273,6 +273,24 @@ describe("Correction 3 — durable multi-batch sync lifecycle invariants", () =>
   });
 });
 
+describe("C4 — the production send-payload resolver is real (no stub)", () => {
+  it('src never reintroduces the throwing "not configured" resolver stub', () => {
+    // Assembled at runtime so this scan file never matches itself.
+    const stub = "send payload resolver" + " not configured";
+    for (const rel of walk("src", [".ts"])) {
+      expect(read(rel).includes(stub), `resolver stub in ${rel}`).toBe(false);
+    }
+  });
+
+  it("the send-executor wiring constructs DraftVersionSendPayloadResolver inside the sendMessage-gated branch", () => {
+    const code = codeLines(read("src/entrypoints/worker.ts")).join("\n");
+    const gate = code.indexOf("if (plan.sendMessage)");
+    const resolver = code.indexOf("new DraftVersionSendPayloadResolver");
+    expect(gate).toBeGreaterThanOrEqual(0);
+    expect(resolver).toBeGreaterThan(gate);
+  });
+});
+
 describe("B7 — send_message acquires no retry behavior", () => {
   it("the send_message queue block keeps retryLimit 0 / retryBackoff false", () => {
     const src = read("src/queues/queue-config.ts");

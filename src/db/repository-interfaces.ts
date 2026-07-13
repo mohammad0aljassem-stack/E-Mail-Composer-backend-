@@ -1,5 +1,6 @@
 import type {
   DraftMirrorRow,
+  DraftVersionRow,
   FolderRole,
   MailboxFolderRow,
   MailboxRow,
@@ -84,6 +85,21 @@ export interface DraftMirrorStore {
     mirroredRevision: bigint;
     status: DraftMirrorRow["status"];
   }): Promise<DraftMirrorRow>;
+}
+
+/**
+ * SELECT-only lookup of the immutable draft snapshot for an EXACT confirmed
+ * revision (public.draft_versions). Returns the highest version_no when
+ * several snapshots share the same source_revision, and null when no snapshot
+ * exists for that exact revision — the caller must fail CLOSED (checkpoints
+ * are not guaranteed for every revision; a near-miss is never substituted).
+ */
+export interface DraftVersionReader {
+  findDraftVersion(
+    workspaceId: string,
+    draftId: string,
+    sourceRevision: bigint,
+  ): Promise<DraftVersionRow | null>;
 }
 
 export interface SendIntentReader {

@@ -71,6 +71,24 @@ export interface DraftMirrorRow {
   status: "pending" | "mirrored" | "stale" | "failed";
 }
 
+/**
+ * Immutable, append-only draft snapshot (public.draft_versions). The worker
+ * reads it ONLY to reconstruct the exact confirmed revision of a send intent /
+ * mirror job (source_revision === the immutable revision); it never reads the
+ * mutable drafts row as authority. body_json is the canonical TipTap-style doc
+ * (jsonb, ≤ 1 MiB) rendered by the worker's deterministic draft-renderer.
+ */
+export interface DraftVersionRow {
+  id: string;
+  workspaceId: string;
+  draftId: string;
+  versionNo: bigint;
+  sourceRevision: bigint;
+  subject: string;
+  bodyJson: unknown;
+  createdAt: Date;
+}
+
 export interface AttachmentManifestEntry {
   filename: string;
   contentType: string;

@@ -17,6 +17,7 @@ import { PgDatabase } from "../db/pool.js";
 import {
   AuditRepository,
   CredentialRepository,
+  DraftVersionRepository,
   FolderRepository,
   HeartbeatRepository,
   MailboxRepository,
@@ -39,6 +40,7 @@ import type {
 import { plannedRegistrations } from "./registration-plan.js";
 import { ImapSmtpProviderFactory } from "../workers/provider-factory.js";
 import { SendExecutor } from "../workers/send-executor.js";
+import { DraftVersionSendPayloadResolver } from "../workers/send-payload-resolver.js";
 import { SyncExecutor } from "../workers/sync-executor.js";
 import { runSyncJob } from "../workers/sync-lifecycle.js";
 import { SyncRequestDispatcher } from "../workers/sync-request-dispatcher.js";
@@ -218,13 +220,17 @@ async function main(): Promise<void> {
         claims: workerClaims,
         audit: new AuditRepository(db),
         providerFactory,
-        payloadResolver: {
-          // Phase 3A ships no draft->payload assembler in the worker; that is a
-          // Phase 3B controlled-mailbox step. Fail closed if invoked.
-          resolve: () => {
-            throw new Error("send payload resolver not configured");
-          },
-        },
+        // Phase 3B C4: the production resolver reconstructs the confirmed
+        // body from the immutable public.draft_versions snapshot (exact
+        // source_revision) + the deterministic worker renderer; the executor
+        // re-verifies the intent hashes before any SMTP byte. Constructed
+        // ONLY inside this sendEnabled-gated branch. NOTE: the canonical
+        // migrations grant transport_worker no SELECT on draft_versions yet,
+        // so until a future additive UI grant migration lands this resolver
+        // fails CLOSED (`draft_version_unreadable`) under the real role.
+        payloadResolver: new DraftVersionSendPayloadResolver({
+          draftVersions: new DraftVersionRepository(db),
+        }),
         clock,
         logger,
         config: {

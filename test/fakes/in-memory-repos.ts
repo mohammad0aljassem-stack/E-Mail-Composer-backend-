@@ -1,5 +1,6 @@
 import type {
   DraftMirrorRow,
+  DraftVersionRow,
   MailboxFolderRow,
   MailboxRow,
   MailMessageMeta,
@@ -13,6 +14,7 @@ import type {
   AuditWriter,
   CredentialReader,
   DraftMirrorStore,
+  DraftVersionReader,
   FolderStore,
   HeartbeatWriter,
   MailboxReader,
@@ -200,6 +202,34 @@ export class FakeDraftMirrorRepo implements DraftMirrorStore {
     };
     this.rows.set(key, row);
     return Promise.resolve(row);
+  }
+}
+
+/**
+ * In-memory public.draft_versions (immutable snapshots). Mirrors the real
+ * SELECT semantics: exact (workspace, draft, source_revision) match, highest
+ * version_no wins, null when no snapshot exists for that exact revision.
+ * `failWith` simulates the role having no SELECT privilege on the table.
+ */
+export class FakeDraftVersionRepo implements DraftVersionReader {
+  public readonly rows: DraftVersionRow[] = [];
+  public failWith: Error | null = null;
+
+  public findDraftVersion(
+    workspaceId: string,
+    draftId: string,
+    sourceRevision: bigint,
+  ): Promise<DraftVersionRow | null> {
+    if (this.failWith !== null) return Promise.reject(this.failWith);
+    const match = this.rows
+      .filter(
+        (r) =>
+          r.workspaceId === workspaceId &&
+          r.draftId === draftId &&
+          r.sourceRevision === sourceRevision,
+      )
+      .sort((a, b) => (a.versionNo < b.versionNo ? 1 : -1))[0];
+    return Promise.resolve(match ?? null);
   }
 }
 

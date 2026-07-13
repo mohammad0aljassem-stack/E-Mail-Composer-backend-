@@ -225,8 +225,27 @@ export class SendExecutor {
       }
       cur = claimed;
 
-      // (4) Integrity re-verification from the `claimed` state.
-      const payload = await this.deps.payloadResolver.resolve(intent);
+      // (4) Integrity re-verification from the `claimed` state. Payload
+      // resolution failures (missing immutable snapshot, unreadable snapshot
+      // table, unsupported attachments, render failure) fail CLOSED right
+      // here: a content-free reason code, ZERO SMTP bytes, non-retryable
+      // (failed_before_delivery is never auto-re-enqueued and the send queue
+      // is retryLimit 0).
+      let payload: ResolvedSendPayload;
+      try {
+        payload = await this.deps.payloadResolver.resolve(intent);
+      } catch (err) {
+        const reason =
+          err instanceof TransportError &&
+          typeof err.context.reason === "string"
+            ? err.context.reason
+            : "payload_resolution_failed";
+        await this.toFailedBeforeDelivery(intent, cur.id, cur.version, {
+          reason,
+        });
+        log.warn("send_payload_resolution_failed", { reason });
+        return "failed_before_delivery";
+      }
       const integrity = await this.verifyIntegrity(intent, payload);
       if (integrity.kind === "human") {
         await this.toNeedsHumanReview(intent, cur.id, cur.version, "claimed", {
