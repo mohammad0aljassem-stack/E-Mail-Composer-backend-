@@ -9,6 +9,7 @@ import { singletonKeys } from "../../src/queues/queue-config.js";
 import {
   FakeMailboxRepo,
   FakeSyncRequestRepo,
+  FakeWorkerClaimRepo,
 } from "../fakes/in-memory-repos.js";
 import { sendableMailbox } from "../helpers/send-fixtures.js";
 import { TestClock } from "../helpers/test-clock.js";
@@ -25,6 +26,7 @@ interface Harness {
   dispatcher: SyncRequestDispatcher;
   syncRequests: FakeSyncRequestRepo;
   mailboxes: FakeMailboxRepo;
+  sendClaims: FakeWorkerClaimRepo;
   clock: TestClock;
   enqueued: Enq[];
   logLines: string[];
@@ -40,6 +42,7 @@ function makeHarness(overrides?: {
 }): Harness {
   const syncRequests = new FakeSyncRequestRepo();
   const mailboxes = new FakeMailboxRepo();
+  const sendClaims = new FakeWorkerClaimRepo();
   mailboxes.rows.set(MB, sendableMailbox({ id: MB, ...overrides?.mailbox }));
   const clock = new TestClock();
   const enqueued: Enq[] = [];
@@ -51,6 +54,7 @@ function makeHarness(overrides?: {
   const deps: SyncRequestDispatcherDeps = {
     syncRequests,
     mailboxes,
+    sendClaims,
     enqueueSync: (job) => {
       enqueued.push({ job, key: singletonKeys.syncRequest(job.syncRequestId) });
       return Promise.resolve(`job-${enqueued.length}`);
@@ -69,6 +73,7 @@ function makeHarness(overrides?: {
     dispatcher: new SyncRequestDispatcher(deps),
     syncRequests,
     mailboxes,
+    sendClaims,
     clock,
     enqueued,
     logLines,
@@ -215,6 +220,55 @@ describe("SyncRequestDispatcher — crash recovery + lease", () => {
     expect(after?.status).toBe("failed");
     expect(after?.lastError).toBe("attempts_exhausted");
     expect(h.enqueued).toHaveLength(0);
+  });
+});
+
+describe("SyncRequestDispatcher — stale send-claim expiry (C7)", () => {
+  // A crashed worker's expired send-claim lease is removed on the dispatch
+  // pass; a fresh lease is untouched. Expiry never enqueues or sends anything.
+  it("expires stale send claims and leaves fresh claims untouched", async () => {
+    const h = makeHarness();
+    await h.sendClaims.tryClaim({
+      sendAttemptId: "attempt-stale",
+      workerId: "crashed-worker",
+      leaseUntil: new Date(h.clock.nowMs() - 1_000), // already expired
+    });
+    await h.sendClaims.tryClaim({
+      sendAttemptId: "attempt-fresh",
+      workerId: "live-worker",
+      leaseUntil: new Date(h.clock.nowMs() + 60_000),
+    });
+    await h.dispatcher.dispatchOnce();
+    expect(h.sendClaims.claims.has("attempt-stale")).toBe(false);
+    expect(h.sendClaims.claims.has("attempt-fresh")).toBe(true);
+    // Content-free count is logged when something expired.
+    const line = h.logLines.find((l) =>
+      l.includes("stale_send_claims_expired"),
+    );
+    expect(line).toBeDefined();
+    expect(line).toContain('"count":1');
+    // Expiry enqueued NOTHING (no auto-resend of any kind).
+    expect(h.enqueued).toHaveLength(0);
+  });
+
+  it("logs nothing when there is no stale claim", async () => {
+    const h = makeHarness();
+    await h.dispatcher.dispatchOnce();
+    expect(
+      h.logLines.some((l) => l.includes("stale_send_claims_expired")),
+    ).toBe(false);
+  });
+
+  // Fail-closed: a kill-switched pass touches nothing, including claims.
+  it("does not touch claims when the global kill switch is engaged", async () => {
+    const h = makeHarness({ globalKillSwitch: true });
+    await h.sendClaims.tryClaim({
+      sendAttemptId: "attempt-stale",
+      workerId: "crashed-worker",
+      leaseUntil: new Date(h.clock.nowMs() - 1_000),
+    });
+    await h.dispatcher.dispatchOnce();
+    expect(h.sendClaims.claims.has("attempt-stale")).toBe(true);
   });
 });
 

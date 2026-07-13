@@ -4,6 +4,7 @@ import type { Logger } from "../observability/logger.js";
 import type {
   MailboxReader,
   SyncRequestStore,
+  WorkerClaimStore,
 } from "../db/repository-interfaces.js";
 import type { SyncMailboxJob } from "../queues/queue-config.js";
 
@@ -64,6 +65,15 @@ import type { SyncMailboxJob } from "../queues/queue-config.js";
 export interface SyncRequestDispatcherDeps {
   syncRequests: SyncRequestStore;
   mailboxes: MailboxReader;
+  /**
+   * Send worker-claim store: each dispatch pass expires stale send-claim
+   * leases (a crashed worker's claim must not block re-driving a queued
+   * attempt forever). Expiry only removes the expired lease row — it never
+   * re-enqueues or re-sends anything; the attempt still needs its normal
+   * claim + state flow, and smtp_in_progress restarts still go to
+   * needs_human_review.
+   */
+  sendClaims: WorkerClaimStore;
   /** Enqueue a durable-request sync job (deterministic key on the request id). */
   enqueueSync: (
     job: SyncMailboxJob & { syncRequestId: string },
@@ -119,6 +129,15 @@ export class SyncRequestDispatcher {
     const leaseCutoff = new Date(
       this.deps.clock.nowMs() - this.deps.config.leaseMs,
     );
+
+    // Expire stale SEND claim leases (crashed worker recovery). Removal only —
+    // no re-enqueue, no auto-resend; content-free count when anything expired.
+    const expiredSendClaims = await this.deps.sendClaims.expireStale(now);
+    if (expiredSendClaims > 0) {
+      this.deps.logger.warn("stale_send_claims_expired", {
+        count: expiredSendClaims,
+      });
+    }
 
     const reaped = await this.deps.syncRequests.reapExhausted({
       now,

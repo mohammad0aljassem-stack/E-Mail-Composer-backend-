@@ -204,6 +204,20 @@ describe("B7 — send_message acquires no retry behavior", () => {
   });
 });
 
+describe("B7 — TLS verification is never disabled in src", () => {
+  it("src contains no rejectUnauthorized (verification stays on, always)", () => {
+    // Any occurrence is banned: the only reason to name this option is to turn
+    // certificate verification off, which would silently permit MITM of the
+    // credential + message bytes. There is no sanctioned exception in src/.
+    for (const rel of walk("src", [".ts"])) {
+      expect(
+        read(rel).includes("rejectUnauthorized"),
+        `rejectUnauthorized in ${rel}`,
+      ).toBe(false);
+    }
+  });
+});
+
 describe("B7 — no unchecked TS escape hatches or secret/MIME logging in src", () => {
   const srcFiles = walk("src", [".ts"]);
 

@@ -18,6 +18,13 @@ export interface MutationExecutorDeps {
   audit: AuditWriter;
   providerFactory: ProviderFactory;
   logger: Logger;
+  config: {
+    /**
+     * Global kill switch. Checked first in execute() so an already-enqueued
+     * mutation never opens IMAP after the switch flips.
+     */
+    globalKillSwitch: boolean;
+  };
 }
 
 export interface MutationJobInput {
@@ -35,6 +42,11 @@ export class MutationExecutor {
       mailboxId: job.mailboxId,
       kind: job.mutation.kind,
     });
+    // Global kill switch: skip content-free BEFORE any provider/IMAP contact.
+    if (this.deps.config.globalKillSwitch) {
+      log.warn("mutation_skipped_global_kill_switch");
+      return;
+    }
     const mailbox = await this.requireMailbox(job.mailboxId);
     const provider = await this.deps.providerFactory.create(mailbox);
     try {

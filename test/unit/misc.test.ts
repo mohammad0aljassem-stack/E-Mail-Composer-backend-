@@ -81,7 +81,7 @@ describe("Heartbeat", () => {
 });
 
 describe("MutationExecutor", () => {
-  it("applies a folder mutation via the provider", async () => {
+  function makeMutationHarness(options?: { globalKillSwitch?: boolean }) {
     const mailboxes = new FakeMailboxRepo();
     mailboxes.rows.set(MAILBOX_ID, sendableMailbox());
     const server = new FakeImapServer();
@@ -94,17 +94,54 @@ describe("MutationExecutor", () => {
       audit,
       providerFactory: factory,
       logger: new JsonLogger({ level: "error", sink: { write: () => {} } }),
+      config: { globalKillSwitch: options?.globalKillSwitch ?? false },
     });
-    await exec.execute({
+    return { exec, server, factory, audit, uid };
+  }
+
+  it("applies a folder mutation via the provider", async () => {
+    const h = makeMutationHarness();
+    await h.exec.execute({
       workspaceId: WORKSPACE_ID,
       mailboxId: MAILBOX_ID,
-      mutation: { kind: "add_flags", folder: "INBOX", uid, flags: ["\\Seen"] },
+      mutation: {
+        kind: "add_flags",
+        folder: "INBOX",
+        uid: h.uid,
+        flags: ["\\Seen"],
+      },
     });
     expect(
-      server.folder("INBOX").messages.get(uid.toString())?.flags.has("\\Seen"),
+      h.server
+        .folder("INBOX")
+        .messages.get(h.uid.toString())
+        ?.flags.has("\\Seen"),
     ).toBe(true);
-    expect(audit.events.some((e) => e.eventType === "mutation_applied")).toBe(
+    expect(h.audit.events.some((e) => e.eventType === "mutation_applied")).toBe(
       true,
     );
+  });
+
+  // C6: the global kill switch skips content-free with ZERO IMAP connects.
+  it("skips under the global kill switch without any IMAP connect", async () => {
+    const h = makeMutationHarness({ globalKillSwitch: true });
+    await h.exec.execute({
+      workspaceId: WORKSPACE_ID,
+      mailboxId: MAILBOX_ID,
+      mutation: {
+        kind: "add_flags",
+        folder: "INBOX",
+        uid: h.uid,
+        flags: ["\\Seen"],
+      },
+    });
+    expect(h.factory.createdCount).toBe(0); // no provider, no IMAP connect
+    expect(
+      h.server
+        .folder("INBOX")
+        .messages.get(h.uid.toString())
+        ?.flags.has("\\Seen"),
+    ).toBe(false);
+    expect(h.audit.events).toHaveLength(0);
   });
 });

@@ -40,9 +40,25 @@ export interface TransportConfig {
   readonly syncMaxAttempts: number;
 }
 
-function bool(value: string | undefined, fallback: boolean): boolean {
+/**
+ * STRICT boolean parsing. Safety-relevant flags (feature flag, global kill
+ * switch) must never silently coerce: "yes"/"on"/"TRUE "/typos previously
+ * parsed to `false`, which for TRANSPORT_GLOBAL_KILL_SWITCH meant DISENGAGED.
+ * Anything but exactly "1"/"true"/"0"/"false" now fails closed at startup. The
+ * rejected token is echoed bounded — these are boolean-ish flags, never secrets.
+ */
+function bool(
+  value: string | undefined,
+  fallback: boolean,
+  name: string,
+): boolean {
   if (value === undefined || value === "") return fallback;
-  return value === "1" || value.toLowerCase() === "true";
+  if (value === "1" || value === "true") return true;
+  if (value === "0" || value === "false") return false;
+  throw new TransportError(
+    "config_invalid",
+    `${name} must be exactly one of 1|true|0|false (got "${value.slice(0, 32)}")`,
+  );
 }
 
 function int(
@@ -128,7 +144,11 @@ function parseKeyring(
 export function loadConfig(
   env: NodeJS.ProcessEnv = process.env,
 ): TransportConfig {
-  const transportEnabled = bool(env.MAIL_TRANSPORT_V1_ENABLED, false);
+  const transportEnabled = bool(
+    env.MAIL_TRANSPORT_V1_ENABLED,
+    false,
+    "MAIL_TRANSPORT_V1_ENABLED",
+  );
 
   const databaseUrl = env.DATABASE_URL ?? "";
   if (databaseUrl === "") {
@@ -166,7 +186,11 @@ export function loadConfig(
     credentialKeyring,
     activeKeyVersion,
     workerId: env.WORKER_ID ?? `worker-${process.pid}`,
-    globalKillSwitch: bool(env.TRANSPORT_GLOBAL_KILL_SWITCH, false),
+    globalKillSwitch: bool(
+      env.TRANSPORT_GLOBAL_KILL_SWITCH,
+      false,
+      "TRANSPORT_GLOBAL_KILL_SWITCH",
+    ),
     logLevel: logLevelRaw as TransportConfig["logLevel"],
     heartbeatIntervalMs: int(
       env.HEARTBEAT_INTERVAL_MS,

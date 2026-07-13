@@ -1,5 +1,6 @@
 import type {
   DraftMirrorRow,
+  FolderRole,
   MailboxFolderRow,
   MailboxRow,
   MailMessageMeta,
@@ -25,7 +26,19 @@ export interface CredentialReader {
   getActiveByMailbox(mailboxId: string): Promise<StoredCredential | null>;
 }
 
-export interface FolderStore {
+/**
+ * Read-only folder-role lookup (SELECT only). Used by the send executor to
+ * resolve the discovered Sent folder (providers localize it — e.g. IONOS
+ * "Gesendete Objekte") instead of relying on a hard-coded name.
+ */
+export interface FolderRoleReader {
+  findByRole(
+    mailboxId: string,
+    role: FolderRole,
+  ): Promise<MailboxFolderRow | null>;
+}
+
+export interface FolderStore extends FolderRoleReader {
   upsertDiscovered(input: {
     workspaceId: string;
     mailboxId: string;

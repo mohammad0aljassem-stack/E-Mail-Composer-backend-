@@ -38,6 +38,45 @@ function roleFromFlagsAndName(
   return "other";
 }
 
+/**
+ * Extract the raw `References` header from an IMAP HEADER.FIELDS response
+ * (ENVELOPE does not carry References). Unfolds continuation lines and bounds
+ * the value via the shared header sanitizer. Header names/ids only — never body.
+ */
+export function parseReferencesHeader(
+  headers: Buffer | undefined,
+): string | null {
+  if (headers === undefined) return null;
+  const unfolded = headers.toString("utf8").replace(/\r?\n[ \t]+/g, " ");
+  const m = /^references:[ \t]*(.+)$/im.exec(unfolded);
+  const value = m?.[1]?.trim() ?? null;
+  return boundHeader(value === "" ? null : value, 4000);
+}
+
+/**
+ * Options passed to ImapFlow, exported so the timeout wiring is unit-testable.
+ * connectionTimeout is set explicitly (ImapFlow's default is 90s, far beyond
+ * the bounded command timeout the worker is configured with).
+ */
+export function buildImapFlowOptions(options: {
+  host: string;
+  port: number;
+  secure: boolean;
+  auth: { user: string; pass: string };
+  timeoutMs: number;
+}): ImapFlowOptions {
+  return {
+    host: options.host,
+    port: options.port,
+    secure: options.secure,
+    auth: { user: options.auth.user, pass: options.auth.pass },
+    logger: false, // never let imapflow log content
+    connectionTimeout: options.timeoutMs,
+    greetingTimeout: options.timeoutMs,
+    socketTimeout: options.timeoutMs,
+  };
+}
+
 export class ImapFlowClient implements ImapClient {
   private readonly client: ImapFlow;
 
@@ -48,16 +87,7 @@ export class ImapFlowClient implements ImapClient {
     auth: { user: string; pass: string };
     timeoutMs: number;
   }) {
-    const opts: ImapFlowOptions = {
-      host: options.host,
-      port: options.port,
-      secure: options.secure,
-      auth: { user: options.auth.user, pass: options.auth.pass },
-      logger: false, // never let imapflow log content
-      greetingTimeout: options.timeoutMs,
-      socketTimeout: options.timeoutMs,
-    };
-    this.client = new ImapFlow(opts);
+    this.client = new ImapFlow(buildImapFlowOptions(options));
   }
 
   public async connect(): Promise<void> {
@@ -130,6 +160,9 @@ export class ImapFlowClient implements ImapClient {
           flags: true,
           size: true,
           bodyStructure: true,
+          // ENVELOPE has no References; fetch ONLY that header (bounded via
+          // parseReferencesHeader) so threading survives sync. Never the body.
+          headers: ["references"],
         },
         { uid: true },
       )) {
@@ -300,6 +333,7 @@ export class ImapFlowClient implements ImapClient {
       flags?: Set<string>;
       size?: number;
       bodyStructure?: { childNodes?: unknown[]; disposition?: string };
+      headers?: Buffer;
     },
     uidvalidity: bigint,
   ): ImapFetchedMessage {
@@ -320,7 +354,7 @@ export class ImapFlowClient implements ImapClient {
       uidvalidity,
       messageId: boundHeader(env.messageId ?? null, 998),
       inReplyTo: boundHeader(env.inReplyTo ?? null, 998),
-      referencesHeader: null,
+      referencesHeader: parseReferencesHeader(msg.headers),
       subject: boundHeader(env.subject ?? null, 2000),
       fromSummary: boundHeader(from, 2000),
       toSummary: boundHeader(to, 4000),
