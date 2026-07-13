@@ -57,6 +57,18 @@ export interface TransportConfig {
    * expiration + the durable lease renewal cadence stay honest).
    */
   readonly syncMaxBatchesPerJob: number;
+  /**
+   * IDLE coordinator (C7): IDLE wait bound per cycle. A silent window
+   * triggers ONE deterministic (deduped) fallback incremental sync.
+   */
+  readonly idleTimeoutMs: number;
+  /** IDLE reconnect backoff bounds (pre-jitter base; ±50% jitter applied). */
+  readonly idleBackoffMinMs: number;
+  readonly idleBackoffMaxMs: number;
+  /** IDLE mailbox-list rescan interval (adopt new / drop disabled). */
+  readonly idleRescanMs: number;
+  /** Global cap on concurrent IDLE sessions (workspace fairness). */
+  readonly idleMaxSessions: number;
 }
 
 /**
@@ -211,6 +223,23 @@ export function loadConfig(
     );
   }
 
+  const idleBackoffMinMs = int(
+    env.IDLE_BACKOFF_MIN_MS,
+    5_000,
+    "IDLE_BACKOFF_MIN_MS",
+  );
+  const idleBackoffMaxMs = int(
+    env.IDLE_BACKOFF_MAX_MS,
+    300_000,
+    "IDLE_BACKOFF_MAX_MS",
+  );
+  if (idleBackoffMaxMs < idleBackoffMinMs) {
+    throw new TransportError(
+      "config_invalid",
+      "IDLE_BACKOFF_MAX_MS must be >= IDLE_BACKOFF_MIN_MS",
+    );
+  }
+
   const logLevelRaw = (env.LOG_LEVEL ?? "info").toLowerCase();
   if (!["debug", "info", "warn", "error"].includes(logLevelRaw)) {
     throw new TransportError(
@@ -270,5 +299,10 @@ export function loadConfig(
       10,
       "SYNC_MAX_BATCHES_PER_JOB",
     ),
+    idleTimeoutMs: int(env.IDLE_TIMEOUT_MS, 300_000, "IDLE_TIMEOUT_MS"),
+    idleBackoffMinMs,
+    idleBackoffMaxMs,
+    idleRescanMs: int(env.IDLE_RESCAN_MS, 60_000, "IDLE_RESCAN_MS"),
+    idleMaxSessions: int(env.IDLE_MAX_SESSIONS, 10, "IDLE_MAX_SESSIONS"),
   };
 }

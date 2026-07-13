@@ -213,3 +213,52 @@ describe("SYNC_MAX_BATCHES_PER_JOB (durable multi-batch loop bound)", () => {
     },
   );
 });
+
+describe("IDLE coordinator settings (C7)", () => {
+  const base = { DATABASE_URL: "postgres://localhost/db" };
+
+  it("applies the documented defaults", () => {
+    const cfg = loadConfig(base);
+    expect(cfg.idleTimeoutMs).toBe(300_000);
+    expect(cfg.idleBackoffMinMs).toBe(5_000);
+    expect(cfg.idleBackoffMaxMs).toBe(300_000);
+    expect(cfg.idleRescanMs).toBe(60_000);
+    expect(cfg.idleMaxSessions).toBe(10);
+  });
+
+  it("accepts explicit positive integers", () => {
+    const cfg = loadConfig({
+      ...base,
+      IDLE_TIMEOUT_MS: "60000",
+      IDLE_BACKOFF_MIN_MS: "1000",
+      IDLE_BACKOFF_MAX_MS: "30000",
+      IDLE_RESCAN_MS: "5000",
+      IDLE_MAX_SESSIONS: "2",
+    });
+    expect(cfg.idleTimeoutMs).toBe(60_000);
+    expect(cfg.idleBackoffMinMs).toBe(1_000);
+    expect(cfg.idleBackoffMaxMs).toBe(30_000);
+    expect(cfg.idleRescanMs).toBe(5_000);
+    expect(cfg.idleMaxSessions).toBe(2);
+  });
+
+  it("rejects an inverted backoff window (max < min) at startup", () => {
+    expect(() =>
+      loadConfig({
+        ...base,
+        IDLE_BACKOFF_MIN_MS: "10000",
+        IDLE_BACKOFF_MAX_MS: "5000",
+      }),
+    ).toThrow(TransportError);
+  });
+
+  it.each([
+    "IDLE_TIMEOUT_MS",
+    "IDLE_BACKOFF_MIN_MS",
+    "IDLE_BACKOFF_MAX_MS",
+    "IDLE_RESCAN_MS",
+    "IDLE_MAX_SESSIONS",
+  ])("rejects a non-positive %s via the strict int parser", (name) => {
+    expect(() => loadConfig({ ...base, [name]: "0" })).toThrow(TransportError);
+  });
+});

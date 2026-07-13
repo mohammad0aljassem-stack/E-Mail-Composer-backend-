@@ -31,6 +31,8 @@ export type CapabilityConfig = Pick<
 export interface RegistrationPlan {
   readonly syncMailbox: boolean;
   readonly syncDispatcher: boolean;
+  /** IDLE coordinator (C7): requires master AND sync AND idle. */
+  readonly idle: boolean;
   readonly applyMutation: boolean;
   readonly sendMessage: boolean;
   readonly draftMirror: boolean;
@@ -44,6 +46,10 @@ export function plannedRegistrations(
   return {
     syncMailbox: sync,
     syncDispatcher: sync,
+    // IDLE requires the sync capability: a wake-up is only ever converted
+    // into an incremental sync job, so without sync there is nothing for the
+    // coordinator to do — the flag fails closed rather than opening sessions.
+    idle: master && config.syncEnabled && config.idleEnabled,
     applyMutation: master && config.mutationsEnabled,
     sendMessage: master && config.sendEnabled,
     draftMirror: master && config.draftMirrorEnabled,

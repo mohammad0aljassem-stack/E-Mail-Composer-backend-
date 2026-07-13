@@ -32,6 +32,7 @@ describe("plannedRegistrations (fail-closed capability gating)", () => {
     expect(plan).toEqual({
       syncMailbox: true,
       syncDispatcher: true,
+      idle: false,
       applyMutation: false,
       sendMessage: false,
       draftMirror: false,
@@ -69,6 +70,7 @@ describe("plannedRegistrations (fail-closed capability gating)", () => {
     expect(send).toEqual({
       syncMailbox: false,
       syncDispatcher: false,
+      idle: false,
       applyMutation: false,
       sendMessage: true,
       draftMirror: false,
@@ -79,6 +81,7 @@ describe("plannedRegistrations (fail-closed capability gating)", () => {
     expect(mutations).toEqual({
       syncMailbox: false,
       syncDispatcher: false,
+      idle: false,
       applyMutation: true,
       sendMessage: false,
       draftMirror: false,
@@ -89,10 +92,34 @@ describe("plannedRegistrations (fail-closed capability gating)", () => {
     expect(mirror).toEqual({
       syncMailbox: false,
       syncDispatcher: false,
+      idle: false,
       applyMutation: false,
       sendMessage: false,
       draftMirror: true,
     });
+  });
+
+  it("C7: idle requires master AND sync AND idle (idle alone fails closed)", () => {
+    // Full stack on → the coordinator is planned.
+    expect(
+      plannedRegistrations(
+        cfg({ transportEnabled: true, syncEnabled: true, idleEnabled: true }),
+      ).idle,
+    ).toBe(true);
+    // idle without sync: a wake-up would have no sync handler to feed → off.
+    expect(
+      plannedRegistrations(cfg({ transportEnabled: true, idleEnabled: true }))
+        .idle,
+    ).toBe(false);
+    // idle + sync without master: defense in depth → off.
+    expect(
+      plannedRegistrations(cfg({ syncEnabled: true, idleEnabled: true })).idle,
+    ).toBe(false);
+    // Gate F matrix (master + sync, idle off) plans no coordinator.
+    expect(
+      plannedRegistrations(cfg({ transportEnabled: true, syncEnabled: true }))
+        .idle,
+    ).toBe(false);
   });
 
   it("C6: a Gate-F config (master + sync only) never registers draft_mirror", () => {

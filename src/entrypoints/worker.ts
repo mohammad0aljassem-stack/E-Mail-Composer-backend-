@@ -40,6 +40,7 @@ import type {
   SyncMailboxJob,
 } from "../queues/queue-config.js";
 import { plannedRegistrations } from "./registration-plan.js";
+import { IdleCoordinator } from "../workers/idle-coordinator.js";
 import { ImapSmtpProviderFactory } from "../workers/provider-factory.js";
 import { DraftMirrorExecutor } from "../workers/draft-mirror-executor.js";
 import { DraftVersionMirrorPayloadResolver } from "../workers/draft-mirror-payload-resolver.js";
@@ -97,6 +98,7 @@ async function main(): Promise<void> {
   heartbeat.start();
 
   let dispatchTimer: ReturnType<typeof setInterval> | null = null;
+  let idleCoordinator: IdleCoordinator | null = null;
 
   // Effective capability registration plan (C2): each handler registers ONLY
   // when the master flag AND its own sub-capability flag are true.
@@ -213,6 +215,34 @@ async function main(): Promise<void> {
         });
       }, config.syncDispatchIntervalMs);
       dispatchTimer.unref?.();
+    }
+
+    if (plan.idle) {
+      // Phase 3B C7: IMAP IDLE + periodic-fallback sync coordinator.
+      // Constructed ONLY when the effective idle capability is on (master &&
+      // sync && idle — see registration-plan). One IMAP session per mailbox
+      // watching INBOX, capped globally with workspace-fair adoption. IMAP
+      // ONLY: the dependency is the capability-scoped createImapSession slice,
+      // so this path can never construct an SMTP client. Wake-ups and silent
+      // IDLE windows both enqueue ONE deduped incremental sync via the plain
+      // mailbox+folder singleton key — never work created from SQL, never an
+      // external scheduler.
+      idleCoordinator = new IdleCoordinator({
+        mailboxes: new MailboxRepository(db),
+        providerFactory,
+        enqueueSync: (job) => queues.enqueueSync(job),
+        logger,
+        config: {
+          idleEnabled: config.idleEnabled,
+          globalKillSwitch: config.globalKillSwitch,
+          idleTimeoutMs: config.idleTimeoutMs,
+          backoffMinMs: config.idleBackoffMinMs,
+          backoffMaxMs: config.idleBackoffMaxMs,
+          rescanMs: config.idleRescanMs,
+          maxSessions: config.idleMaxSessions,
+        },
+      });
+      await idleCoordinator.start();
     }
 
     if (plan.sendMessage) {
@@ -338,6 +368,7 @@ async function main(): Promise<void> {
     logger.info("workers_registered", {
       sync_mailbox: plan.syncMailbox,
       sync_dispatcher: plan.syncDispatcher,
+      idle: plan.idle,
       send_message: plan.sendMessage,
       apply_mutation: plan.applyMutation,
       draft_mirror: plan.draftMirror,
@@ -352,6 +383,10 @@ async function main(): Promise<void> {
     logger.info("shutdown_begin", { signal });
     if (dispatchTimer !== null) clearInterval(dispatchTimer);
     void (async (): Promise<void> => {
+      // Close every active IDLE session before stopping the queues.
+      if (idleCoordinator !== null) {
+        await idleCoordinator.stop().catch(() => undefined);
+      }
       await queues.stop().catch(() => undefined);
       await heartbeat.stop().catch(() => undefined);
       await db.end().catch(() => undefined);
