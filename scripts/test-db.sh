@@ -10,11 +10,12 @@
 # create a LOCAL, least-privileged `transport_worker` login role. Production
 # provisioning of that role is a SEPARATE, manual, audited op.
 #
-# The FULL canonical chain (all FIVE migrations) is loaded and every Phase 3
-# migration is checksum-pinned. This FAILS CLOSED if the UI checkout SHA differs,
-# any expected migration file is missing, any checksum differs, or the schema
-# would otherwise be loaded through PR#4 alone (i.e. without the Phase 3 contract
-# hardening + the worker-transition grant migrations).
+# The FULL canonical chain (baseline + all SEVEN migrations; the five Phase 3
+# migrations are checksum-pinned) is loaded. This FAILS CLOSED if the UI checkout
+# SHA differs, any expected migration file is missing, any checksum differs, or
+# the schema would otherwise be loaded without the Phase 3 contract hardening,
+# the worker-transition grant, the confirmed-send-snapshot accessors, or the
+# send-MIME-artifact migrations.
 #
 # Usage:
 #   bash scripts/test-db.sh            # start (reuse if running), load schema
@@ -57,6 +58,8 @@ MIG_PHASE2="$UI_REPO/supabase/migrations/20260712100000_enforce_phase2_rpc_invar
 MIG_FOUNDATION="$UI_REPO/supabase/migrations/20260713100000_transport_foundation.sql"
 MIG_HARDENING="$UI_REPO/supabase/migrations/20260714100000_transport_contract_hardening.sql"
 MIG_GRANT="$UI_REPO/supabase/migrations/20260715100000_worker_transition_grant.sql"
+MIG_SNAPSHOTS="$UI_REPO/supabase/migrations/20260716100000_confirmed_send_snapshots.sql"
+MIG_MIME="$UI_REPO/supabase/migrations/20260717100000_send_mime_artifacts.sql"
 
 if ! command -v initdb >/dev/null 2>&1; then
   PG_BIN="$(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1 || true)"
@@ -102,7 +105,7 @@ fi
 
 # 1. Every file in the FULL chain must be present (a missing hardening/grant
 #    migration means the schema could only be loaded through PR#4 — reject it).
-for f in "$BASELINE" "$MIG_DRAFT" "$MIG_PHASE2" "$MIG_FOUNDATION" "$MIG_HARDENING" "$MIG_GRANT"; do
+for f in "$BASELINE" "$MIG_DRAFT" "$MIG_PHASE2" "$MIG_FOUNDATION" "$MIG_HARDENING" "$MIG_GRANT" "$MIG_SNAPSHOTS" "$MIG_MIME"; do
   if [ ! -f "$f" ]; then
     echo "ERROR: required schema file missing: $f" >&2
     echo "Set UI_REPO to the sibling UI checkout at merged SHA $EXPECTED_UI_SHA (full chain)." >&2
@@ -121,7 +124,7 @@ if git -C "$UI_REPO" rev-parse --git-dir >/dev/null 2>&1; then
   fi
 fi
 
-# 3. All THREE Phase 3 checksums must match the UI manifest exactly. The expected
+# 3. All FIVE Phase 3 checksums must match the UI manifest exactly. The expected
 #    values are read FROM the manifest (single source), never hand-copied here.
 verify_sha() {
   local label="$1" file="$2" expected actual
@@ -141,7 +144,9 @@ verify_sha() {
 verify_sha "foundation (20260713100000)" "$MIG_FOUNDATION"
 verify_sha "hardening  (20260714100000)" "$MIG_HARDENING"
 verify_sha "grant      (20260715100000)" "$MIG_GRANT"
-echo "Canonical pin verified: UI $EXPECTED_UI_SHA, 3 Phase 3 checksums OK (from manifest)."
+verify_sha "snapshots  (20260716100000)" "$MIG_SNAPSHOTS"
+verify_sha "mime       (20260717100000)" "$MIG_MIME"
+echo "Canonical pin verified: UI $EXPECTED_UI_SHA, 5 Phase 3 checksums OK (from manifest)."
 
 if check_running; then
   echo "Reusing PostgreSQL already running on port $PORT."
@@ -164,21 +169,27 @@ apply() {
   echo "  applying $(basename "$2")"
   psql "${PSQL_ARGS[@]}" -d "$DB_NAME" -v ON_ERROR_STOP=1 -q -f "$2" >/dev/null
 }
-echo "Loading canonical schema (baseline + FULL 5-migration chain @ UI $EXPECTED_UI_SHA)..."
+echo "Loading canonical schema (baseline + FULL 7-migration chain @ UI $EXPECTED_UI_SHA)..."
 apply baseline "$BASELINE"
 apply draft "$MIG_DRAFT"
 apply phase2 "$MIG_PHASE2"
 apply foundation "$MIG_FOUNDATION"
 apply hardening "$MIG_HARDENING"
 apply grant "$MIG_GRANT"
+apply snapshots "$MIG_SNAPSHOTS"
+apply mime "$MIG_MIME"
 
 # --- TEST-ONLY: give the worker role a local login only ----------------------
-# NO privilege injection here. The canonical worker-transition grant migration
-# (20260715100000) already grants transport_worker EXECUTE on
-# public.phase3_send_attempt_transition_ok(text,text), so the SECURITY INVOKER
-# BEFORE UPDATE trigger on send_attempts can advance the state machine under the
-# real least-privilege role WITHOUT any test-only GRANT. We add ONLY a login +
-# CONNECT so the integration suite can authenticate as the role.
+# NO privilege injection here. The canonical chain already grants transport_worker
+# every privilege the worker needs from the migrations themselves: EXECUTE on
+# public.phase3_send_attempt_transition_ok(text,text) (20260715100000) so the
+# SECURITY INVOKER BEFORE UPDATE trigger on send_attempts can advance the state
+# machine; EXECUTE on the private transport.get_send_snapshot(uuid) /
+# transport.get_mirror_snapshot(uuid,uuid,bigint) accessors (20260716100000); and
+# EXECUTE on transport.create_or_verify_send_mime_artifact(...) plus SELECT/UPDATE
+# on transport.send_mime_artifacts (20260717100000). All under the real
+# least-privilege role WITHOUT any test-only GRANT (draft_versions itself is never
+# granted). We add ONLY a login + CONNECT so the suite can authenticate.
 echo "Configuring TEST-ONLY worker login role (login+connect only, no grants)..."
 psql "${PSQL_ARGS[@]}" -d "$DB_NAME" -v ON_ERROR_STOP=1 -q \
   -c "ALTER ROLE $WORKER_ROLE LOGIN PASSWORD '$WORKER_PASS';" \

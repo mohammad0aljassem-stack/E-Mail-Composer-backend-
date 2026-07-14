@@ -30,6 +30,14 @@
 //      validator public.phase3_send_attempt_transition_ok(text,text)
 //   8  forbiddenFunctionPrivileges / forbiddenTablePrivileges carry the
 //      browser-role EXECUTE and worker INSERT+DELETE denials (structural)
+//   8b (v2) requiredFunctionPrivileges grant transport_worker EXECUTE on the
+//      three private v2 accessors — transport.get_send_snapshot(uuid),
+//      transport.get_mirror_snapshot(uuid,uuid,bigint) and
+//      transport.create_or_verify_send_mime_artifact(uuid,uuid,uuid,text,text,
+//      bigint,bytea) — and forbid every browser role EXECUTE on all three.
+//   8c (v2) requiredTablePrivileges for transport.send_mime_artifacts is
+//      EXACTLY [SELECT, UPDATE] for the worker, and forbiddenTablePrivileges
+//      denies it INSERT + DELETE (no forged/destroyed artifact rows).
 //   9  protectedPrivateSchemas includes "transport"
 //   10 backend QUEUE names (src/queues/queue-config.ts) === manifest queue names
 //   11 QUEUE_DEFINITIONS[send_message].retryLimit === 0
@@ -72,6 +80,16 @@ const LOCK_PATH = join(
 const VALIDATOR = "public.phase3_send_attempt_transition_ok(text,text)";
 const WORKER_ROLE = "transport_worker";
 const BROWSER_ROLES = ["public", "anon", "authenticated"];
+
+// Phase 3B (contract v2) private worker accessors + the exact-MIME artifact
+// table the worker persists before any SMTP byte. These are additive to the
+// v1 boundary and are required, fail-closed, EXECUTE grants for the worker.
+const V2_WORKER_FUNCTIONS = [
+  "transport.get_send_snapshot(uuid)",
+  "transport.get_mirror_snapshot(uuid,uuid,bigint)",
+  "transport.create_or_verify_send_mime_artifact(uuid,uuid,uuid,text,text,bigint,bytea)",
+];
+const MIME_ARTIFACT_TABLE = "transport.send_mime_artifacts";
 
 const errors = [];
 const fail = (msg) => errors.push(msg);
@@ -261,6 +279,89 @@ if (manifest !== null) {
       if (!workerWriteForbidden.privileges.includes(priv)) {
         fail(
           `[8] forbiddenTablePrivileges for ${WORKER_ROLE} on transport.sync_requests must include ${priv}.`,
+        );
+      }
+    }
+  }
+
+  // --- 8b. requiredFunctionPrivileges: worker EXECUTE on the v2 private
+  //         snapshot accessors + the exact-MIME artifact function (fail-closed;
+  //         the worker's ONLY read path for confirmed content and its ONLY
+  //         write path for the pre-SMTP MIME artifact are these DEFINER fns). --
+  for (const fn of V2_WORKER_FUNCTIONS) {
+    const present = reqFn.some(
+      (p) =>
+        p &&
+        p.function === fn &&
+        p.privilege === "EXECUTE" &&
+        p.grantee === WORKER_ROLE,
+    );
+    if (!present) {
+      fail(
+        `[8b] requiredFunctionPrivileges must grant ${WORKER_ROLE} EXECUTE on ${fn}.`,
+      );
+    }
+  }
+  // The same three functions must be forbidden to every browser role.
+  for (const fn of V2_WORKER_FUNCTIONS) {
+    for (const role of BROWSER_ROLES) {
+      const present = forbFn.some(
+        (p) =>
+          p &&
+          p.function === fn &&
+          p.privilege === "EXECUTE" &&
+          p.grantee === role,
+      );
+      if (!present) {
+        fail(
+          `[8b] forbiddenFunctionPrivileges must forbid ${role} EXECUTE on ${fn}.`,
+        );
+      }
+    }
+  }
+
+  // --- 8c. transport.send_mime_artifacts privilege boundary. The worker holds
+  //         EXACTLY [SELECT, UPDATE] (create/verify is via the DEFINER fn; the
+  //         retention-clearing UPDATE is direct) and is FORBIDDEN INSERT/DELETE
+  //         so it can never forge or destroy an artifact row. -----------------
+  const reqTbl = Array.isArray(manifest.requiredTablePrivileges)
+    ? manifest.requiredTablePrivileges
+    : [];
+  const mimeRequired = reqTbl.find(
+    (t) =>
+      t &&
+      t.table === MIME_ARTIFACT_TABLE &&
+      t.grantee === WORKER_ROLE &&
+      Array.isArray(t.privileges),
+  );
+  if (!mimeRequired) {
+    fail(
+      `[8c] requiredTablePrivileges must carry a ${MIME_ARTIFACT_TABLE} entry for ${WORKER_ROLE}.`,
+    );
+  } else {
+    const got = [...mimeRequired.privileges].sort().join(",");
+    if (got !== "SELECT,UPDATE") {
+      fail(
+        `[8c] requiredTablePrivileges for ${WORKER_ROLE} on ${MIME_ARTIFACT_TABLE} must be exactly [SELECT, UPDATE]; found [${got}].`,
+      );
+    }
+  }
+  const mimeForbidden = forbTbl.find(
+    (t) =>
+      t &&
+      t.table === MIME_ARTIFACT_TABLE &&
+      t.grantee === WORKER_ROLE &&
+      Array.isArray(t.privileges),
+  );
+  if (!mimeForbidden) {
+    fail(
+      `[8c] forbiddenTablePrivileges must carry a ${MIME_ARTIFACT_TABLE} entry for ${WORKER_ROLE}.`,
+    );
+  } else {
+    for (const priv of ["INSERT", "DELETE"]) {
+      if (!mimeForbidden.privileges.includes(priv)) {
+        fail(
+          `[8c] forbiddenTablePrivileges for ${WORKER_ROLE} on ${MIME_ARTIFACT_TABLE} must include ${priv}.`,
         );
       }
     }
@@ -593,9 +694,10 @@ function report() {
       `  manifest: ${lock.manifestPath} (sha256 ${lock.manifestSha256})\n` +
       `  versions: manifestSchema=${lock.supportedManifestSchemaVersion}, ` +
       `transportContract=${lock.supportedTransportContractVersion}\n` +
-      "  checks 1–16 (incl. 12b, 15b) passed (SHA, manifest hash, versions, migration " +
-      "checksums, privilege/queue/flag boundaries, capability-flag defaults, " +
-      "sync lease CAS, static regression scans).",
+      "  checks 1–16 (incl. 8b, 8c, 12b, 15b) passed (SHA, manifest hash, versions, " +
+      "migration checksums, privilege/queue/flag boundaries incl. the v2 private " +
+      "accessors + MIME-artifact table, capability-flag defaults, sync lease CAS, " +
+      "static regression scans).",
   );
   process.exit(0);
 }

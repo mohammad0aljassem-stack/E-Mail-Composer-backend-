@@ -37,12 +37,13 @@ const lock = JSON.parse(
 
 // The FINAL merged UI SHA (Workstream A). Kept here only to assert the lock's
 // value; every consumer reads it FROM the lock, not from a literal.
-const UI_SHA = "44c62c630b1db6bbdbcf5c95863bd3b896a77c99";
+const UI_SHA = "4bca2fc927c552f6466d9e8124e9b07c9770d1c1";
 
 // Superseded / never-live UI SHAs. Abbreviated prefixes match their full forms
-// too. This array is the ONLY sanctioned occurrence of these strings in the
-// repo; the negative guard proves they appear nowhere in live code/config.
-const OBSOLETE_SHAS = ["67daad9", "e4653d7", "422485a"];
+// too. 44c62c6 is the Phase 3A merged SHA, now superseded by the Phase 3B v2
+// merge (4bca2fc). This array is the ONLY sanctioned occurrence of these strings
+// in the repo; the negative guard proves they appear nowhere in live code/config.
+const OBSOLETE_SHAS = ["67daad9", "e4653d7", "422485a", "44c62c6"];
 
 describe("canonical pin — the lock is the single source of truth", () => {
   it("pins the FINAL merged UI SHA and the supported versions", () => {
@@ -52,7 +53,7 @@ describe("canonical pin — the lock is the single source of truth", () => {
     );
     expect(lock.manifestSha256).toMatch(/^[0-9a-f]{64}$/);
     expect(lock.supportedManifestSchemaVersion).toBe(1);
-    expect(lock.supportedTransportContractVersion).toBe(1);
+    expect(lock.supportedTransportContractVersion).toBe(2);
   });
 });
 
@@ -85,7 +86,7 @@ describe("canonical pin — test-db.sh reads the lock + manifest", () => {
     expect(sh).toContain("canonical-transport-contract.lock.json");
     expect(sh).toContain("lock_get uiCommitSha");
     expect(sh).toMatch(/manifest_sha/);
-    // The FULL five-migration chain is still loaded (baseline + 5).
+    // The FULL migration chain is still loaded (baseline + 7 migrations).
     for (const f of [
       "production_schema_2026_07_11.sql",
       "20260711130000_draft_lifecycle.sql",
@@ -93,6 +94,8 @@ describe("canonical pin — test-db.sh reads the lock + manifest", () => {
       "20260713100000_transport_foundation.sql",
       "20260714100000_transport_contract_hardening.sql",
       "20260715100000_worker_transition_grant.sql",
+      "20260716100000_confirmed_send_snapshots.sql",
+      "20260717100000_send_mime_artifacts.sql",
     ]) {
       expect(sh).toContain(f);
     }

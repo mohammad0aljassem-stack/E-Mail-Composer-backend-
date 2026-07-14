@@ -11,7 +11,7 @@ enable transport in production.**
   Postgres and creates a **local** `transport_worker` login (login + connect
   only, **no injected grants**). It does **not** own or ship migrations — the
   sibling UI repo (`E-Mail-Composer-UI`, merged
-  `44c62c630b1db6bbdbcf5c95863bd3b896a77c99`) is the single owner. The expected
+  `4bca2fc927c552f6466d9e8124e9b07c9770d1c1`) is the single owner. The expected
   UI SHA and the migration checksums it enforces are read from
   `config/canonical-transport-contract.lock.json` + the UI manifest, never
   hand-copied. It never touches a hosted database.
@@ -34,7 +34,7 @@ enable transport in production.**
 - **Phase 2 readiness remains a separate gate** and is unaffected by this PR.
 
 The schema this worker is built against is pinned to UI SHA
-`44c62c630b1db6bbdbcf5c95863bd3b896a77c99` via
+`4bca2fc927c552f6466d9e8124e9b07c9770d1c1` via
 `config/canonical-transport-contract.lock.json`, and the three Phase 3 migration
 checksums are enforced against the UI's machine-readable manifest
 (`supabase/contracts/phase3-transport-contract.json`). Any mismatch — a wrong UI
