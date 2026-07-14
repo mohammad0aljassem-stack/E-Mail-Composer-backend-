@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import pg from "pg";
 import { SyncRequestRepository } from "../../src/db/repositories.js";
 import { PgDatabase } from "../../src/db/pool.js";
+import { singletonKeys } from "../../src/queues/queue-config.js";
 import { HAS_DB, seedContext, superuserPool, WORKER_URL } from "./helpers.js";
 
 const d = HAS_DB ? describe : describe.skip;
@@ -250,3 +251,105 @@ d("durable sync_requests — lease, stale reclaim, terminal states", () => {
     expect(failed?.lastError).toBe("sync_failed");
   });
 });
+
+d(
+  "durable sync_requests — two-worker reclaim RACE (generation + token fencing)",
+  () => {
+    let admin: pg.Pool;
+    let workerA: PgDatabase;
+    let workerB: PgDatabase;
+    beforeAll(() => {
+      admin = superuserPool();
+      workerA = new PgDatabase({ connectionString: WORKER_URL });
+      workerB = new PgDatabase({ connectionString: WORKER_URL });
+    });
+    afterAll(async () => {
+      await workerA.end();
+      await workerB.end();
+      await admin.end();
+    });
+
+    // The core cross-generation safety proof against REAL Postgres: once a stale
+    // lease is reclaimed into a new generation, the OLD generation's claimant can
+    // change nothing — every fenced CAS (renew/complete/fail) loses — while the
+    // new generation owns the request. The generation-scoped dispatch keys differ.
+    it("a superseded generation-1 claimant can change NOTHING; generation-2 owns the request", async () => {
+      const ctx = await seedContext(admin);
+      const req = await requestSync(admin, ctx);
+      const repoA = new SyncRequestRepository(workerA);
+      const repoB = new SyncRequestRepository(workerB);
+
+      // (1) Worker A claims the pending request -> generation g1, token t1.
+      const tA = new Date();
+      const claimedA = await repoA.claimBatch({
+        limit: 10,
+        now: tA,
+        leaseCutoff: new Date(tA.getTime() - 300_000),
+        maxAttempts: 5,
+      });
+      const rowA = claimedA.find((r) => r.id === req.id)!;
+      const g1 = rowA.attemptCount;
+      const t1 = rowA.claimedAt!;
+      expect(g1).toBe(1);
+
+      // (2) The lease goes stale, then Worker B reclaims -> g2 = g1+1, t2 != t1.
+      await admin.query(
+        `update transport.sync_requests
+          set claimed_at = now() - interval '10 minutes' where id = $1`,
+        [req.id],
+      );
+      const tB = new Date();
+      const claimedB = await repoB.claimBatch({
+        limit: 10,
+        now: tB,
+        leaseCutoff: new Date(tB.getTime() - 300_000),
+        maxAttempts: 5,
+      });
+      const rowB = claimedB.find((r) => r.id === req.id)!;
+      const g2 = rowB.attemptCount;
+      const t2 = rowB.claimedAt!;
+      expect(g2).toBe(g1 + 1);
+      expect(t2.getTime()).not.toBe(t1.getTime());
+
+      // Snapshot the row (owned by g2 now) before A's doomed attempts.
+      const before = await repoA.getById(req.id);
+
+      // (3) A still holds (g1, t1): EVERY fenced write loses (returns null).
+      expect(await repoA.renewLease(req.id, g1, t1, new Date())).toBeNull();
+      expect(await repoA.markCompleted(req.id, g1, t1, new Date())).toBeNull();
+      expect(
+        await repoA.markFailed({
+          id: req.id,
+          expectedGeneration: g1,
+          expectedToken: t1,
+          now: new Date(),
+          lastError: "sync_failed",
+        }),
+      ).toBeNull();
+      // A changed NOTHING: status / last_error / claimed_at are exactly as B left
+      // them; the generation is still g2.
+      const afterA = await repoA.getById(req.id);
+      expect(afterA?.status).toBe(before?.status);
+      expect(afterA?.lastError).toBe(before?.lastError);
+      expect(afterA?.claimedAt?.getTime()).toBe(before?.claimedAt?.getTime());
+      expect(afterA?.attemptCount).toBe(g2);
+
+      // (4) B holds (g2, t2): renew succeeds (new token), then completes.
+      const t3 = await repoB.renewLease(req.id, g2, t2, new Date());
+      expect(t3).not.toBeNull();
+      const done = await repoB.markCompleted(req.id, g2, t3!, new Date());
+      expect(done?.status).toBe("completed");
+
+      // (5) The generation-scoped singleton keys for g1 and g2 differ.
+      expect(singletonKeys.syncRequest(req.id, g1)).toBe(
+        `sync-req:${req.id}:gen:1`,
+      );
+      expect(singletonKeys.syncRequest(req.id, g2)).toBe(
+        `sync-req:${req.id}:gen:2`,
+      );
+      expect(singletonKeys.syncRequest(req.id, g1)).not.toBe(
+        singletonKeys.syncRequest(req.id, g2),
+      );
+    });
+  },
+);
