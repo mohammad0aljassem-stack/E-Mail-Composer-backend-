@@ -149,16 +149,22 @@ d("durable sync_requests — lease, stale reclaim, terminal states", () => {
       folder?: string | null;
     },
   ): Promise<string> {
+    // Seed claimed_at from a JS Date parameter (MILLISECOND precision), exactly
+    // as production writes it (claimBatch/renewLease always set claimed_at from a
+    // JS Date). A DB-side `now()` would store microseconds that do not survive
+    // the JS Date round-trip used to derive a fencing token, which would break a
+    // token-equality CAS in a way production never sees.
+    const claimedAt = new Date(Date.now() - opts.claimedAgoMs);
     const r = await admin.query<{ id: string }>(
       `insert into transport.sync_requests
          (workspace_id, mailbox_id, folder, status, claimed_at, attempt_count)
-       values ($1,$2,$3,'claimed', now() - ($4::text || ' milliseconds')::interval, $5)
+       values ($1,$2,$3,'claimed', $4, $5)
        returning id`,
       [
         ctx.workspaceId,
         ctx.mailboxId,
         opts.folder ?? null,
-        String(opts.claimedAgoMs),
+        claimedAt,
         opts.attemptCount,
       ],
     );
