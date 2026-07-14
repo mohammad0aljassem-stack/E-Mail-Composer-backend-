@@ -1,26 +1,29 @@
 import type {
   DraftMirrorRow,
-  DraftVersionRow,
   MailboxFolderRow,
   MailboxRow,
   MailMessageMeta,
+  MirrorSnapshotRow,
   SendAttemptRow,
   SendIntentRow,
+  SendSnapshotRow,
   StoredCredential,
   SyncRequestRow,
 } from "../../src/domain/models.js";
 import { canTransition, type SendState } from "../../src/domain/send-state.js";
+import { SnapshotUnavailableError } from "../../src/domain/errors.js";
 import type {
   AuditWriter,
   CredentialReader,
   DraftMirrorStore,
-  DraftVersionReader,
   FolderStore,
   HeartbeatWriter,
   MailboxReader,
   MessageStore,
+  MirrorSnapshotReader,
   SendAttemptStore,
   SendIntentReader,
+  SendSnapshotReader,
   SyncRequestStore,
   WorkerClaimStore,
 } from "../../src/db/repository-interfaces.js";
@@ -206,20 +209,49 @@ export class FakeDraftMirrorRepo implements DraftMirrorStore {
 }
 
 /**
- * In-memory public.draft_versions (immutable snapshots). Mirrors the real
- * SELECT semantics: exact (workspace, draft, source_revision) match, highest
- * version_no wins, null when no snapshot exists for that exact revision.
- * `failWith` simulates the role having no SELECT privilege on the table.
+ * In-memory transport.get_send_snapshot(send_intent_id). Keyed by the intent id
+ * (the sole key — the real function resolves the exact bound snapshot from the
+ * intent, never a workspace/draft/revision lookup the worker controls). A
+ * missing key or `failWith` rejects with the content-free SnapshotUnavailableError,
+ * exactly as the real accessor's uniform P0002 does for every
+ * missing/legacy/inconsistent case.
  */
-export class FakeDraftVersionRepo implements DraftVersionReader {
-  public readonly rows: DraftVersionRow[] = [];
+export class FakeSendSnapshotRepo implements SendSnapshotReader {
+  public readonly rows = new Map<string, SendSnapshotRow>();
   public failWith: Error | null = null;
 
-  public findDraftVersion(
+  public getSendSnapshot(sendIntentId: string): Promise<SendSnapshotRow> {
+    if (this.failWith !== null) return Promise.reject(this.failWith);
+    const row = this.rows.get(sendIntentId);
+    if (row === undefined)
+      return Promise.reject(new SnapshotUnavailableError());
+    return Promise.resolve(row);
+  }
+}
+
+/**
+ * In-memory transport.get_mirror_snapshot(workspace, draft, source_revision).
+ * Mirrors the real semantics: exact (workspace, draft, source_revision) match,
+ * highest version_no wins, and a uniform P0002 (→ SnapshotUnavailableError) when
+ * none exists. Seed rows carry the keying revision explicitly (the returned row
+ * shape omits it, matching the function's TABLE columns). `failWith` simulates
+ * an unreadable accessor.
+ */
+export interface MirrorSnapshotSeed extends MirrorSnapshotRow {
+  workspaceId: string;
+  draftId: string;
+  sourceRevision: bigint;
+}
+
+export class FakeMirrorSnapshotRepo implements MirrorSnapshotReader {
+  public readonly rows: MirrorSnapshotSeed[] = [];
+  public failWith: Error | null = null;
+
+  public getMirrorSnapshot(
     workspaceId: string,
     draftId: string,
     sourceRevision: bigint,
-  ): Promise<DraftVersionRow | null> {
+  ): Promise<MirrorSnapshotRow> {
     if (this.failWith !== null) return Promise.reject(this.failWith);
     const match = this.rows
       .filter(
@@ -229,7 +261,15 @@ export class FakeDraftVersionRepo implements DraftVersionReader {
           r.sourceRevision === sourceRevision,
       )
       .sort((a, b) => (a.versionNo < b.versionNo ? 1 : -1))[0];
-    return Promise.resolve(match ?? null);
+    if (match === undefined) {
+      return Promise.reject(new SnapshotUnavailableError());
+    }
+    return Promise.resolve({
+      draftVersionId: match.draftVersionId,
+      versionNo: match.versionNo,
+      subject: match.subject,
+      bodyJson: match.bodyJson,
+    });
   }
 }
 

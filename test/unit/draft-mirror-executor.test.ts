@@ -1,5 +1,4 @@
 import { describe, expect, it } from "vitest";
-import type { DraftVersionRow } from "../../src/domain/models.js";
 import { JsonLogger } from "../../src/observability/logger.js";
 import {
   DraftMirrorExecutor,
@@ -9,8 +8,9 @@ import { DraftVersionMirrorPayloadResolver } from "../../src/workers/draft-mirro
 import {
   FakeAuditRepo,
   FakeDraftMirrorRepo,
-  FakeDraftVersionRepo,
   FakeMailboxRepo,
+  FakeMirrorSnapshotRepo,
+  type MirrorSnapshotSeed,
 } from "../fakes/in-memory-repos.js";
 import { FakeImapServer } from "../fakes/fake-imap.js";
 import { FakeSmtpClient } from "../fakes/fake-smtp.js";
@@ -162,23 +162,22 @@ describe("DraftVersionMirrorPayloadResolver (C6, production resolver)", () => {
   };
 
   function versionRow(
-    overrides: Partial<DraftVersionRow> = {},
-  ): DraftVersionRow {
+    overrides: Partial<MirrorSnapshotSeed> = {},
+  ): MirrorSnapshotSeed {
     return {
-      id: "77777777-7777-7777-7777-777777777777",
+      draftVersionId: "77777777-7777-7777-7777-777777777777",
       workspaceId: WORKSPACE_ID,
       draftId: DRAFT_ID,
       versionNo: 2n,
       sourceRevision: 3n,
       subject: "Mirrored subject",
       bodyJson: SNAPSHOT_DOC,
-      createdAt: new Date("2026-07-02T08:30:00Z"),
       ...overrides,
     };
   }
 
-  function makeResolver(rows: DraftVersionRow[] = [versionRow()]) {
-    const versions = new FakeDraftVersionRepo();
+  function makeResolver(rows: MirrorSnapshotSeed[] = [versionRow()]) {
+    const versions = new FakeMirrorSnapshotRepo();
     versions.rows.push(...rows);
     const mailboxes = new FakeMailboxRepo();
     mailboxes.rows.set(MAILBOX_ID, sendableMailbox());
@@ -186,7 +185,7 @@ describe("DraftVersionMirrorPayloadResolver (C6, production resolver)", () => {
       versions,
       mailboxes,
       resolver: new DraftVersionMirrorPayloadResolver({
-        draftVersions: versions,
+        mirrorSnapshots: versions,
         mailboxes,
       }),
     };
@@ -201,13 +200,14 @@ describe("DraftVersionMirrorPayloadResolver (C6, production resolver)", () => {
     expect(raw).toContain("Subject: Mirrored subject");
     expect(raw).toContain("From: sender@mail.example.com");
     expect(raw).toContain("mirrored draft body");
-    // Deterministic, non-routable, revision-scoped Message-ID; pinned Date
-    // from the immutable snapshot timestamp → idempotent rebuilds.
+    // Deterministic, non-routable, revision-scoped Message-ID; Date pinned to a
+    // fixed epoch (the private mirror accessor exposes no created_at) →
+    // byte-stable header across idempotent rebuilds.
     expect(raw).toContain(`Message-ID: <draft-${DRAFT_ID}.r3@mirror.invalid>`);
-    expect(raw).toContain("Date: Thu, 02 Jul 2026 08:30:00 +0000");
+    expect(raw).toContain("Date: Thu, 01 Jan 1970 00:00:00 +0000");
     const again = await resolver.resolve(job(3n));
     expect(again!.mime.toString("utf8")).toContain(
-      "Date: Thu, 02 Jul 2026 08:30:00 +0000",
+      "Date: Thu, 01 Jan 1970 00:00:00 +0000",
     );
   });
 
@@ -216,7 +216,7 @@ describe("DraftVersionMirrorPayloadResolver (C6, production resolver)", () => {
     expect(await resolver.resolve(job(3n))).toBeNull();
   });
 
-  it("fails closed (null) when the snapshot table is unreadable", async () => {
+  it("fails closed (null) when the snapshot accessor is unreadable", async () => {
     const { versions, resolver } = makeResolver();
     versions.failWith = new Error("permission denied");
     expect(await resolver.resolve(job(3n))).toBeNull();

@@ -5,22 +5,17 @@ import { recomputeConfirmationProof } from "../../src/domain/confirmation-proof.
 import type { SendIntentRow } from "../../src/domain/models.js";
 import {
   DraftMirrorRepository,
-  DraftVersionRepository,
   FolderRepository,
   MessageRepository,
+  MirrorSnapshotRepository,
   SendAttemptRepository,
+  SendSnapshotRepository,
   WorkerClaimRepository,
 } from "../../src/db/repositories.js";
 import { PgDatabase } from "../../src/db/pool.js";
 import { renderDraftBody } from "../../src/mime/draft-renderer.js";
 import { DraftVersionSendPayloadResolver } from "../../src/workers/send-payload-resolver.js";
-import {
-  HAS_DB,
-  seedContext,
-  superuserPool,
-  SUPERUSER_URL,
-  WORKER_URL,
-} from "./helpers.js";
+import { HAS_DB, seedContext, superuserPool, WORKER_URL } from "./helpers.js";
 
 const d = HAS_DB ? describe : describe.skip;
 
@@ -245,128 +240,200 @@ d("message dedupe + draft mirror guard (real DB)", () => {
   });
 });
 
-d("draft_versions snapshot access (Phase 3B C4, real grants)", () => {
-  let admin: pg.Pool;
-  let adminDb: PgDatabase;
-  let worker: PgDatabase;
-  beforeAll(() => {
-    admin = superuserPool();
-    adminDb = new PgDatabase({ connectionString: SUPERUSER_URL });
-    worker = new PgDatabase({ connectionString: WORKER_URL });
-  });
-  afterAll(async () => {
-    await worker.end();
-    await adminDb.end();
-    await admin.end();
-  });
+d(
+  "confirmed-send snapshot access via the private function (v2, real grants)",
+  () => {
+    let admin: pg.Pool;
+    let worker: PgDatabase;
+    beforeAll(() => {
+      admin = superuserPool();
+      worker = new PgDatabase({ connectionString: WORKER_URL });
+    });
+    afterAll(async () => {
+      await worker.end();
+      await admin.end();
+    });
 
-  const SNAPSHOT_DOC = {
-    type: "doc",
-    content: [
-      {
-        type: "paragraph",
-        content: [{ type: "text", text: "integration snapshot body" }],
-      },
-    ],
-  };
+    const SNAPSHOT_DOC = {
+      type: "doc",
+      content: [
+        {
+          type: "paragraph",
+          content: [{ type: "text", text: "integration snapshot body" }],
+        },
+      ],
+    };
 
-  async function seedVersion(ctx: {
-    workspaceId: string;
-    draftId: string;
-    userId: string;
-  }): Promise<void> {
-    await admin.query(
-      `insert into public.draft_versions
+    /**
+     * Seed a fully-formed v2 confirmation directly (as superuser): an immutable
+     * draft_versions snapshot + a send_intent bound to it by the composite
+     * identity FK, with proof_version = 2 / contract_version = 2. Mirrors exactly
+     * what create_send_intent writes, so transport.get_send_snapshot accepts it.
+     */
+    async function seedV2Intent(ctx: {
+      workspaceId: string;
+      mailboxId: string;
+      draftId: string;
+      userId: string;
+    }): Promise<{ intentId: string; draftVersionId: string }> {
+      const dv = await admin.query<{ id: string }>(
+        `insert into public.draft_versions
          (workspace_id, draft_id, version_no, source_revision, subject,
           body_json, reason, created_by)
-       values ($1,$2,1,1,'subject',$3::jsonb,'manual_checkpoint',$4)`,
-      [ctx.workspaceId, ctx.draftId, JSON.stringify(SNAPSHOT_DOC), ctx.userId],
-    );
-  }
-
-  function intentFor(ctx: {
-    workspaceId: string;
-    mailboxId: string;
-    draftId: string;
-    userId: string;
-  }): SendIntentRow {
-    return {
-      id: randomUUID(),
-      workspaceId: ctx.workspaceId,
-      mailboxId: ctx.mailboxId,
-      draftId: ctx.draftId,
-      draftRevision: 1n,
-      sender: "sender@test.local",
-      recipients: { to: ["r@test.local"] },
-      subject: "subject",
-      htmlHash: null,
-      textHash: null,
-      attachmentManifest: [],
-      messageId: messageId(),
-      idempotencyKey: `idem-${randomUUID()}`,
-      templateVersionId: null,
-      signatureId: null,
-      confirmedBy: ctx.userId,
-      confirmationProof: "a".repeat(64),
-      contractVersion: 1,
-    };
-  }
-
-  // DECISION PROBE: the canonical migrations grant transport_worker NO
-  // privilege on public.draft_versions (foundation grant block: mailboxes,
-  // send_intents, ... — draft_versions absent). Until a FUTURE additive
-  // UI-owned grant migration lands, the worker role cannot read snapshots and
-  // MAIL_SEND_ENABLED cannot deliver in a real environment. This test pins
-  // that reality; no grant is injected anywhere in this repo.
-  it("transport_worker has NO SELECT on public.draft_versions (42501)", async () => {
-    try {
-      await worker.query(`select id from public.draft_versions limit 1`);
-      expect.unreachable("worker SELECT on draft_versions should be denied");
-    } catch (err) {
-      expect((err as { code?: string }).code).toBe("42501");
+       values ($1,$2,1,1,'subject',$3::jsonb,'send_confirmation',$4)
+       returning id`,
+        [
+          ctx.workspaceId,
+          ctx.draftId,
+          JSON.stringify(SNAPSHOT_DOC),
+          ctx.userId,
+        ],
+      );
+      const draftVersionId = dv.rows[0]!.id;
+      const intent = await admin.query<{ id: string }>(
+        `insert into public.send_intents
+         (workspace_id, mailbox_id, draft_id, draft_revision, sender, recipients,
+          subject, message_id, idempotency_key, confirmed_by, confirmation_proof,
+          contract_version, draft_version_id, proof_version)
+       values ($1,$2,$3,1,'sender@test.local',
+               '{"to":["r@test.local"]}'::jsonb,'subject',$4,$5,$6,$7,2,$8,2)
+       returning id`,
+        [
+          ctx.workspaceId,
+          ctx.mailboxId,
+          ctx.draftId,
+          messageId(),
+          `idem-${randomUUID()}`,
+          ctx.userId,
+          "a".repeat(64),
+          draftVersionId,
+        ],
+      );
+      return { intentId: intent.rows[0]!.id, draftVersionId };
     }
-  });
 
-  it("the resolver fails CLOSED (draft_version_unreadable) under the worker role", async () => {
-    const ctx = await seedContext(admin);
-    await seedVersion(ctx);
-    const resolver = new DraftVersionSendPayloadResolver({
-      draftVersions: new DraftVersionRepository(worker),
-    });
-    await expect(resolver.resolve(intentFor(ctx))).rejects.toMatchObject({
-      name: "TransportError",
-      code: "send_precondition_failed",
-      context: { reason: "draft_version_unreadable" },
-    });
-  });
+    function intentFor(
+      ctx: {
+        workspaceId: string;
+        mailboxId: string;
+        draftId: string;
+        userId: string;
+      },
+      intentId: string,
+    ): SendIntentRow {
+      return {
+        id: intentId,
+        workspaceId: ctx.workspaceId,
+        mailboxId: ctx.mailboxId,
+        draftId: ctx.draftId,
+        draftRevision: 1n,
+        sender: "sender@test.local",
+        recipients: { to: ["r@test.local"] },
+        subject: "subject",
+        htmlHash: null,
+        textHash: null,
+        attachmentManifest: [],
+        messageId: messageId(),
+        idempotencyKey: `idem-${randomUUID()}`,
+        templateVersionId: null,
+        signatureId: null,
+        confirmedBy: ctx.userId,
+        confirmationProof: "a".repeat(64),
+        contractVersion: 2,
+        proofVersion: 2,
+        draftVersionId: null,
+      };
+    }
 
-  it("full resolver round-trip against the real schema via the service path", async () => {
-    // Proves the SELECT shape + jsonb rendering against the canonical schema.
-    // Runs over the superuser connection because the worker role's grant is a
-    // documented follow-up (see the probe above).
-    const ctx = await seedContext(admin);
-    await seedVersion(ctx);
-    const resolver = new DraftVersionSendPayloadResolver({
-      draftVersions: new DraftVersionRepository(adminDb),
+    // The worker has NO table grant on public.draft_versions — it reads confirmed
+    // content ONLY through the private SECURITY DEFINER accessor. This negative
+    // guard pins that a direct SELECT is denied (42501) even though the accessor
+    // works (next test).
+    it("transport_worker has NO direct SELECT on public.draft_versions (42501)", async () => {
+      try {
+        await worker.query(`select id from public.draft_versions limit 1`);
+        expect.unreachable("worker SELECT on draft_versions should be denied");
+      } catch (err) {
+        expect((err as { code?: string }).code).toBe("42501");
+      }
     });
-    const payload = await resolver.resolve(intentFor(ctx));
-    expect(payload.revision).toBe(1n);
-    const rendered = renderDraftBody(SNAPSHOT_DOC);
-    expect(payload.message.html).toBe(rendered.html);
-    expect(payload.message.text).toBe(rendered.text);
-    expect(payload.message.attachments).toEqual([]);
-  });
 
-  it("a missing exact-revision snapshot resolves to fail-closed (service path)", async () => {
-    const ctx = await seedContext(admin); // no draft_versions row seeded
-    const resolver = new DraftVersionSendPayloadResolver({
-      draftVersions: new DraftVersionRepository(adminDb),
+    it("the WORKER role CAN execute transport.get_send_snapshot with NO test-only grant", async () => {
+      const ctx = await seedContext(admin);
+      const { intentId, draftVersionId } = await seedV2Intent(ctx);
+      // Executes as the least-privileged worker login — the only grant is the
+      // canonical EXECUTE from migration 20260716100000.
+      const repo = new SendSnapshotRepository(worker);
+      const snap = await repo.getSendSnapshot(intentId);
+      expect(snap.draftVersionId).toBe(draftVersionId);
+      expect(snap.workspaceId).toBe(ctx.workspaceId);
+      expect(snap.draftId).toBe(ctx.draftId);
+      expect(snap.sourceRevision).toBe(1n);
+      expect(snap.subject).toBe("subject");
+      expect(snap.bodyJson).toEqual(SNAPSHOT_DOC);
     });
-    await expect(resolver.resolve(intentFor(ctx))).rejects.toMatchObject({
-      context: { reason: "draft_revision_snapshot_missing" },
+
+    it("send happy path resolves via the function under the worker role", async () => {
+      const ctx = await seedContext(admin);
+      const { intentId } = await seedV2Intent(ctx);
+      const resolver = new DraftVersionSendPayloadResolver({
+        sendSnapshots: new SendSnapshotRepository(worker),
+      });
+      const payload = await resolver.resolve(intentFor(ctx, intentId));
+      expect(payload.revision).toBe(1n);
+      const rendered = renderDraftBody(SNAPSHOT_DOC);
+      expect(payload.message.html).toBe(rendered.html);
+      expect(payload.message.text).toBe(rendered.text);
+      expect(payload.message.attachments).toEqual([]);
     });
-  });
-});
+
+    it("a legacy (proof-v1) intent is non-sendable: uniform P0002 → snapshot_unavailable", async () => {
+      const ctx = await seedContext(admin);
+      // Legacy shape: no draft_version_id, proof_version/contract_version default 1.
+      const legacy = await admin.query<{ id: string }>(
+        `insert into public.send_intents
+         (workspace_id, mailbox_id, draft_id, draft_revision, sender, recipients,
+          subject, message_id, idempotency_key, confirmed_by, confirmation_proof)
+       values ($1,$2,$3,1,'sender@test.local',
+               '{"to":["r@test.local"]}'::jsonb,'subject',$4,$5,$6,$7)
+       returning id`,
+        [
+          ctx.workspaceId,
+          ctx.mailboxId,
+          ctx.draftId,
+          messageId(),
+          `idem-${randomUUID()}`,
+          ctx.userId,
+          "a".repeat(64),
+        ],
+      );
+      const repo = new SendSnapshotRepository(worker);
+      await expect(
+        repo.getSendSnapshot(legacy.rows[0]!.id),
+      ).rejects.toMatchObject({ code: "snapshot_unavailable" });
+      // And a wholly unknown intent id fails identically (indistinguishable).
+      await expect(repo.getSendSnapshot(randomUUID())).rejects.toMatchObject({
+        code: "snapshot_unavailable",
+      });
+    });
+
+    it("the WORKER role CAN execute transport.get_mirror_snapshot; missing → P0002", async () => {
+      const ctx = await seedContext(admin);
+      await seedV2Intent(ctx); // also lands a draft_versions row at revision 1
+      const repo = new MirrorSnapshotRepository(worker);
+      const snap = await repo.getMirrorSnapshot(
+        ctx.workspaceId,
+        ctx.draftId,
+        1n,
+      );
+      expect(snap.subject).toBe("subject");
+      expect(snap.bodyJson).toEqual(SNAPSHOT_DOC);
+      await expect(
+        repo.getMirrorSnapshot(ctx.workspaceId, ctx.draftId, 999n),
+      ).rejects.toMatchObject({ code: "snapshot_unavailable" });
+    });
+  },
+);
 
 d("confirmation-proof parity: SQL RPC vs TS re-derivation", () => {
   let admin: pg.Pool;
@@ -403,11 +470,15 @@ d("confirmation-proof parity: SQL RPC vs TS re-derivation", () => {
         sender: string;
         draft_revision: string;
         contract_version: number;
+        proof_version: number;
+        draft_version_id: string;
       }>(
+        // v2: the confirmed subject MUST byte-match the locked draft subject
+        // (seedContext seeds 'subject'); p_contract_version defaults to 2.
         `select * from public.create_send_intent(
            $1,$2,$3, 1, $4,
            '{"to":["r@test.local"],"cc":["c@test.local"]}'::jsonb,
-           'Hello subject',
+           'subject',
            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
            null,
            '[{"filename":"a.txt","contentType":"text/plain","sizeBytes":3,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]'::jsonb
@@ -436,6 +507,8 @@ d("confirmation-proof parity: SQL RPC vs TS re-derivation", () => {
         confirmedBy: ctx.userId,
         confirmationProof: row.confirmation_proof,
         contractVersion: row.contract_version,
+        proofVersion: row.proof_version,
+        draftVersionId: row.draft_version_id,
       };
       const recomputed = recomputeConfirmationProof(intent);
       expect(recomputed).toBe(row.confirmation_proof);

@@ -1,7 +1,10 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { recomputeConfirmationProof } from "../../src/domain/confirmation-proof.js";
-import { TransportError } from "../../src/domain/errors.js";
-import type { DraftVersionRow } from "../../src/domain/models.js";
+import {
+  SnapshotUnavailableError,
+  TransportError,
+} from "../../src/domain/errors.js";
+import type { SendSnapshotRow } from "../../src/domain/models.js";
 import { renderDraftBody } from "../../src/mime/draft-renderer.js";
 import { JsonLogger } from "../../src/observability/logger.js";
 import {
@@ -11,11 +14,11 @@ import {
 import { DraftVersionSendPayloadResolver } from "../../src/workers/send-payload-resolver.js";
 import {
   FakeAuditRepo,
-  FakeDraftVersionRepo,
   FakeFolderRepo,
   FakeMailboxRepo,
   FakeSendAttemptRepo,
   FakeSendIntentRepo,
+  FakeSendSnapshotRepo,
   FakeWorkerClaimRepo,
 } from "../fakes/in-memory-repos.js";
 import { FakeImapServer } from "../fakes/fake-imap.js";
@@ -33,10 +36,11 @@ import {
 } from "../helpers/send-fixtures.js";
 
 /**
- * Phase 3B C4 — DraftVersionSendPayloadResolver. Sends reconstruct the
- * confirmed body from the IMMUTABLE draft_versions snapshot (exact
- * source_revision) and the deterministic renderer; every failure fails CLOSED
- * with a content-free reason and zero SMTP bytes.
+ * Phase 3B (contract v2) — DraftVersionSendPayloadResolver. Sends reconstruct
+ * the confirmed body from the EXACT snapshot bound to the intent, resolved
+ * SOLELY by send_intent_id through the private transport.get_send_snapshot
+ * function. The resolver has NO drafts-table dependency at all; every failure
+ * fails CLOSED with a content-free reason and zero SMTP bytes.
  */
 
 const SNAPSHOT_DOC = {
@@ -49,16 +53,17 @@ const SNAPSHOT_DOC = {
   ],
 };
 
-function versionRow(overrides: Partial<DraftVersionRow> = {}): DraftVersionRow {
+function snapshotRow(
+  overrides: Partial<SendSnapshotRow> = {},
+): SendSnapshotRow {
   return {
-    id: "77777777-7777-7777-7777-777777777777",
+    draftVersionId: "77777777-7777-7777-7777-777777777777",
     workspaceId: WORKSPACE_ID,
     draftId: DRAFT_ID,
-    versionNo: 4n,
     sourceRevision: 1n,
+    versionNo: 4n,
     subject: "Test subject",
     bodyJson: SNAPSHOT_DOC,
-    createdAt: new Date("2026-07-01T00:00:00Z"),
     ...overrides,
   };
 }
@@ -67,7 +72,7 @@ interface Harness {
   exec: SendExecutor;
   deps: SendExecutorDeps;
   fixture: BuiltFixture;
-  versions: FakeDraftVersionRepo;
+  snapshots: FakeSendSnapshotRepo;
   attempts: FakeSendAttemptRepo;
   smtp: FakeSmtpClient;
   factory: FakeProviderFactory;
@@ -83,8 +88,9 @@ async function makeHarness(): Promise<Harness> {
     text: rendered.text,
   });
 
-  const versions = new FakeDraftVersionRepo();
-  versions.rows.push(versionRow());
+  // The snapshot is bound to the intent by its id — the sole resolution key.
+  const snapshots = new FakeSendSnapshotRepo();
+  snapshots.rows.set(INTENT_ID, snapshotRow());
 
   const mailboxes = new FakeMailboxRepo();
   mailboxes.rows.set(fixture.intent.mailboxId, sendableMailbox());
@@ -107,7 +113,7 @@ async function makeHarness(): Promise<Harness> {
     audit: new FakeAuditRepo(),
     providerFactory: factory,
     payloadResolver: new DraftVersionSendPayloadResolver({
-      draftVersions: versions,
+      sendSnapshots: snapshots,
     }),
     clock: new TestClock(),
     logger: new JsonLogger({ level: "error", sink: { write: () => {} } }),
@@ -122,7 +128,7 @@ async function makeHarness(): Promise<Harness> {
     exec: new SendExecutor(deps),
     deps,
     fixture,
-    versions,
+    snapshots,
     attempts,
     smtp,
     factory,
@@ -139,7 +145,7 @@ async function reasonOf(h: Harness): Promise<unknown> {
   return (await h.attempts.getById(ATTEMPT_ID))?.evidence.reason;
 }
 
-describe("DraftVersionSendPayloadResolver — exact-revision resolution", () => {
+describe("DraftVersionSendPayloadResolver — exact snapshot resolution", () => {
   let h: Harness;
   beforeEach(async () => {
     h = await makeHarness();
@@ -153,26 +159,9 @@ describe("DraftVersionSendPayloadResolver — exact-revision resolution", () => 
     expect((await h.attempts.getById(ATTEMPT_ID))?.state).toBe("completed");
   });
 
-  it("picks the HIGHEST version_no among snapshots of the same source_revision", async () => {
-    // An older checkpoint of the same revision with a different body: the
-    // resolver must prefer version_no 4 (the canonical latest snapshot).
-    h.versions.rows.push(
-      versionRow({
-        id: "88888888-8888-8888-8888-888888888888",
-        versionNo: 2n,
-        bodyJson: {
-          type: "doc",
-          content: [
-            {
-              type: "paragraph",
-              content: [{ type: "text", text: "older checkpoint" }],
-            },
-          ],
-        },
-      }),
-    );
+  it("renders EXACTLY the snapshot the function returned for the intent id", async () => {
     const resolver = new DraftVersionSendPayloadResolver({
-      draftVersions: h.versions,
+      sendSnapshots: h.snapshots,
     });
     const payload = await resolver.resolve(h.fixture.intent);
     expect(payload.revision).toBe(1n);
@@ -182,7 +171,7 @@ describe("DraftVersionSendPayloadResolver — exact-revision resolution", () => 
 
   it("echoes sender/recipients/subject/Message-ID from the intent (no substitution)", async () => {
     const resolver = new DraftVersionSendPayloadResolver({
-      draftVersions: h.versions,
+      sendSnapshots: h.snapshots,
     });
     const payload = await resolver.resolve(h.fixture.intent);
     expect(payload.message.sender).toBe(h.fixture.intent.sender);
@@ -192,33 +181,16 @@ describe("DraftVersionSendPayloadResolver — exact-revision resolution", () => 
     expect(payload.message.attachments).toEqual([]);
   });
 
-  it("ignores the mutable draft entirely — the resolver has NO drafts dependency", async () => {
-    // The deps surface is exactly one SELECT-only snapshot reader: there is no
-    // drafts repository to read, so a later edit can never leak into a send.
-    const deps = { draftVersions: h.versions };
+  it("has NO drafts-table dependency — its ONLY dep is the snapshot accessor", async () => {
+    // The deps surface is exactly one accessor keyed by send_intent_id: there is
+    // no drafts/draft_versions repository to read, and no workspace/draft/
+    // revision lookup the worker controls, so a later edit or a near-miss
+    // revision can never leak into a send.
+    const deps = { sendSnapshots: h.snapshots };
     const resolver = new DraftVersionSendPayloadResolver(deps);
-    expect(Object.keys(deps)).toEqual(["draftVersions"]);
-    // Even if the "current" draft changed to revision 9, the intent's revision
-    // 1 snapshot is what resolves.
-    h.versions.rows.push(
-      versionRow({
-        id: "99999999-9999-9999-9999-999999999999",
-        versionNo: 9n,
-        sourceRevision: 9n,
-        bodyJson: {
-          type: "doc",
-          content: [
-            {
-              type: "paragraph",
-              content: [{ type: "text", text: "newer unconfirmed edit" }],
-            },
-          ],
-        },
-      }),
-    );
+    expect(Object.keys(deps)).toEqual(["sendSnapshots"]);
     const payload = await resolver.resolve(h.fixture.intent);
     expect(payload.message.html).toContain("Confirmed snapshot body");
-    expect(payload.message.html).not.toContain("newer unconfirmed edit");
   });
 });
 
@@ -228,11 +200,14 @@ describe("DraftVersionSendPayloadResolver — fail-closed paths", () => {
     h = await makeHarness();
   });
 
-  it("missing exact-revision snapshot → failed_before_delivery, zero SMTP", async () => {
-    h.versions.rows.length = 0; // no snapshot for the confirmed revision
+  it("get_send_snapshot P0002 (missing/legacy/inconsistent intent) → snapshot_unavailable, zero SMTP", async () => {
+    // A uniform P0002 — the worker can never tell whether the intent was
+    // missing, legacy (proof-v1 / contract != 2), or bound to an inconsistent
+    // snapshot; all collapse to one fail-closed code.
+    h.snapshots.rows.clear();
     const outcome = await h.exec.execute(JOB);
     expect(outcome).toBe("failed_before_delivery");
-    expect(await reasonOf(h)).toBe("draft_revision_snapshot_missing");
+    expect(await reasonOf(h)).toBe("snapshot_unavailable");
     expect(h.smtp.submissions).toHaveLength(0);
     expect(h.factory.submissionsCreated).toBe(0);
     expect((await h.attempts.getById(ATTEMPT_ID))?.state).toBe(
@@ -240,24 +215,25 @@ describe("DraftVersionSendPayloadResolver — fail-closed paths", () => {
     );
   });
 
-  it("a NEAR-MISS revision is never substituted (source_revision must be exact)", async () => {
-    h.versions.rows.length = 0;
-    h.versions.rows.push(versionRow({ sourceRevision: 2n })); // off by one
+  it("a wrong-workspace/draft/revision intent (P0002 from the function) fails closed identically", async () => {
+    // Simulated exactly as the DB does: the private function raises P0002, the
+    // repository maps it to SnapshotUnavailableError. The resolver cannot (and
+    // does not) distinguish it from a missing intent.
+    h.snapshots.failWith = new SnapshotUnavailableError();
     const outcome = await h.exec.execute(JOB);
     expect(outcome).toBe("failed_before_delivery");
-    expect(await reasonOf(h)).toBe("draft_revision_snapshot_missing");
+    expect(await reasonOf(h)).toBe("snapshot_unavailable");
     expect(h.smtp.submissions).toHaveLength(0);
+    expect(h.factory.submissionsCreated).toBe(0);
   });
 
-  it("unreadable snapshot table (no SELECT privilege) → draft_version_unreadable", async () => {
-    h.versions.failWith = new Error(
-      "permission denied for table draft_versions",
-    );
+  it("an unreadable accessor (any driver error) also fails closed as snapshot_unavailable", async () => {
+    h.snapshots.failWith = new Error("permission denied for function");
     const outcome = await h.exec.execute(JOB);
     expect(outcome).toBe("failed_before_delivery");
-    expect(await reasonOf(h)).toBe("draft_version_unreadable");
+    expect(await reasonOf(h)).toBe("snapshot_unavailable");
     expect(h.smtp.submissions).toHaveLength(0);
-    // The driver error text (which names the table) never reaches evidence.
+    // The driver error text never reaches evidence.
     const evidence = JSON.stringify(
       (await h.attempts.getById(ATTEMPT_ID))?.evidence,
     );
@@ -283,24 +259,8 @@ describe("DraftVersionSendPayloadResolver — fail-closed paths", () => {
     expect(h.factory.submissionsCreated).toBe(0);
   });
 
-  it("a cross-scope row from a misbehaving reader is rejected (assert)", async () => {
-    const resolver = new DraftVersionSendPayloadResolver({
-      draftVersions: {
-        findDraftVersion: () =>
-          Promise.resolve(
-            versionRow({
-              workspaceId: "99999999-9999-9999-9999-999999999999",
-            }),
-          ),
-      },
-    });
-    await expect(resolver.resolve(h.fixture.intent)).rejects.toMatchObject({
-      context: { reason: "draft_version_scope_mismatch" },
-    });
-  });
-
   it("an invalid snapshot body → draft_render_failed", async () => {
-    h.versions.rows[0] = versionRow({ bodyJson: { type: "not-a-doc" } });
+    h.snapshots.rows.set(INTENT_ID, snapshotRow({ bodyJson: { type: "x" } }));
     const outcome = await h.exec.execute(JOB);
     expect(outcome).toBe("failed_before_delivery");
     expect(await reasonOf(h)).toBe("draft_render_failed");
@@ -308,17 +268,20 @@ describe("DraftVersionSendPayloadResolver — fail-closed paths", () => {
   });
 
   it("a snapshot body over the 1 MiB bound → draft_body_bounds_exceeded", async () => {
-    h.versions.rows[0] = versionRow({
-      bodyJson: {
-        type: "doc",
-        content: [
-          {
-            type: "paragraph",
-            content: [{ type: "text", text: "z".repeat(1_100_000) }],
-          },
-        ],
-      },
-    });
+    h.snapshots.rows.set(
+      INTENT_ID,
+      snapshotRow({
+        bodyJson: {
+          type: "doc",
+          content: [
+            {
+              type: "paragraph",
+              content: [{ type: "text", text: "z".repeat(1_100_000) }],
+            },
+          ],
+        },
+      }),
+    );
     const outcome = await h.exec.execute(JOB);
     expect(outcome).toBe("failed_before_delivery");
     expect(await reasonOf(h)).toBe("draft_body_bounds_exceeded");
@@ -326,9 +289,9 @@ describe("DraftVersionSendPayloadResolver — fail-closed paths", () => {
   });
 
   it("resolver failures raise TransportError with content-free context only", async () => {
-    h.versions.rows.length = 0;
+    h.snapshots.rows.clear();
     const resolver = new DraftVersionSendPayloadResolver({
-      draftVersions: h.versions,
+      sendSnapshots: h.snapshots,
     });
     try {
       await resolver.resolve(h.fixture.intent);

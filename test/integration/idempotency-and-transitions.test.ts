@@ -46,18 +46,20 @@ async function createIntent(
       [ctx.userId],
     );
     const r = await client.query<{ id: string }>(
+      // v2: p_contract_version MUST be 2, and the confirmed subject MUST
+      // byte-match the locked draft subject (seedContext seeds 'subject').
       `select id from public.create_send_intent(
          $1,$2,$3, 1, $4,
          '{"to":["r@test.local"]}'::jsonb,
          $5,
          null, null, '[]'::jsonb,
-         null, null, 1, $6)`,
+         null, null, 2, $6)`,
       [
         ctx.workspaceId,
         ctx.mailboxId,
         ctx.draftId,
         sender,
-        opts.subject ?? "Hello",
+        opts.subject ?? "subject",
         opts.key,
       ],
     );
@@ -95,7 +97,11 @@ d("create_send_intent idempotency contract (B6)", () => {
   it("identical key + DIVERGENT payload → P0409 (deterministic conflict)", async () => {
     const ctx = await seedContext(admin);
     const key = `idem-${randomUUID()}`;
-    await createIntent(admin, ctx, { key, subject: "First" });
+    // First call uses the matching (locked) subject and succeeds. The replay
+    // reuses the key with a DIVERGENT subject: the input-only fingerprint
+    // differs, so strict idempotency raises P0409 at the idempotency check
+    // (before the subject gate) — the deterministic-conflict contract.
+    await createIntent(admin, ctx, { key });
     let code: string | undefined;
     try {
       await createIntent(admin, ctx, { key, subject: "Divergent" });
