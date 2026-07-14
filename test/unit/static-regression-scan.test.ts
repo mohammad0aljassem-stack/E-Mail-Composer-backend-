@@ -483,3 +483,129 @@ describe("B7 — no unchecked TS escape hatches or secret/MIME logging in src", 
     }
   });
 });
+
+describe("Contract v2 — the worker reads confirmed content only via the snapshot functions", () => {
+  it("no src code line reads the mutable public.draft_versions table", () => {
+    // The worker resolves confirmed subject/body/revision ONLY through
+    // transport.get_send_snapshot / get_mirror_snapshot (the private DEFINER
+    // accessors); it has no draft_versions table grant. Every remaining
+    // `draft_versions` mention is an explanatory COMMENT (filtered by
+    // codeLines) — an actual table read would be a fail-closed-bypass
+    // regression. The Slice-1 DraftVersionRepository/findDraftVersion was
+    // deleted; this tripwire keeps it deleted.
+    for (const rel of walk("src", [".ts"])) {
+      for (const line of codeLines(read(rel))) {
+        expect(
+          line.includes("draft_versions"),
+          `direct draft_versions reference in code of ${rel}: ${line.trim()}`,
+        ).toBe(false);
+      }
+    }
+  });
+
+  it("the resolver goes through get_send_snapshot (not a raw draft read)", () => {
+    // Positive assertion: the snapshot accessor is actually wired, so the
+    // negative scan above cannot pass merely because the read path was removed.
+    const repos = read("src/db/repositories.ts");
+    expect(repos).toContain("transport.get_send_snapshot");
+  });
+});
+
+describe("Contract v2 — MIME artifacts are created only via the DEFINER function", () => {
+  // The worker has SELECT + UPDATE on transport.send_mime_artifacts and NO
+  // INSERT/DELETE; rows are created ONLY by
+  // transport.create_or_verify_send_mime_artifact (which re-hashes the caller's
+  // bytes). A direct INSERT/DELETE would bypass the byte-identity + bound
+  // verification. sync_requests is likewise browser-RPC-inserted only.
+  const forbidden = [
+    /insert\s+into\s+transport\.send_mime_artifacts\b/i,
+    /delete\s+from\s+transport\.send_mime_artifacts\b/i,
+    /insert\s+into\s+transport\.sync_requests\b/i,
+    /delete\s+from\s+transport\.sync_requests\b/i,
+  ];
+  it("src never directly INSERTs/DELETEs the artifact or sync-request tables", () => {
+    for (const rel of walk("src", [".ts"])) {
+      const code = codeLines(read(rel)).join("\n");
+      for (const re of forbidden) {
+        expect(
+          re.test(code),
+          `direct ${re} on a DEFINER-only private table in ${rel}`,
+        ).toBe(false);
+      }
+    }
+  });
+
+  it("the artifact store goes through create_or_verify_send_mime_artifact", () => {
+    const repos = read("src/db/repositories.ts");
+    expect(repos).toContain("transport.create_or_verify_send_mime_artifact");
+  });
+
+  it("the send restart/reconcile path reuses stored bytes and never rebuilds MIME", () => {
+    // reconcileSentCopy must append the EXACT persisted rawMime (getBySendAttempt)
+    // — never re-render/re-encode a message on the restart path, which could
+    // change bytes and double-send divergent content.
+    const exec = read("src/workers/send-executor.ts");
+    const body =
+      /private async reconcileSentCopy\([\s\S]*?\n {2}(?:private|public) async /.exec(
+        exec,
+      );
+    expect(
+      body,
+      "reconcileSentCopy not found in send-executor.ts",
+    ).not.toBeNull();
+    expect(
+      body![0].includes("buildOutboundMime"),
+      "reconcileSentCopy rebuilds MIME instead of reusing the stored artifact",
+    ).toBe(false);
+  });
+});
+
+describe("Phase 4 — durable sync fencing is generation-scoped and payload-sourced", () => {
+  it("every durable sync-request singleton key carries the :gen: generation", () => {
+    // A key without the generation would let a superseded claimant's job dedup
+    // against (or be deduped by) a live one across a reclaim. Both the dispatch
+    // key and the continuation key must be generation-scoped.
+    for (const rel of walk("src", [".ts"])) {
+      for (const line of codeLines(read(rel))) {
+        if (!line.includes("sync-req:")) continue;
+        expect(
+          line.includes(":gen:"),
+          `generation-less durable sync key in ${rel}: ${line.trim()}`,
+        ).toBe(true);
+      }
+    }
+  });
+
+  it("the sync lifecycle sources its fencing tuple from the job payload, not a re-read", () => {
+    // Adopting a freshly re-read claimed_at (getById) as the token would defeat
+    // fencing: a stale worker would 'renew' against whatever the CURRENT holder
+    // wrote. The tuple must come from the immutable job payload.
+    const life = read("src/workers/sync-lifecycle.ts");
+    expect(
+      /\.getById\s*\(/.test(life),
+      "sync-lifecycle re-reads the row (getById) instead of using the payload tuple",
+    ).toBe(false);
+    expect(life).toContain("claimGeneration");
+    expect(life).toContain("claimToken");
+  });
+
+  it("markCompleted and markFailed call sites pass a generation + token (fenced)", () => {
+    // The fenced store signatures are (id, expectedGeneration, expectedToken, ...).
+    // A call site that passed only an id would be an unfenced completion/failure.
+    const CALL = /\.(markCompleted|markFailed)\s*\(/;
+    for (const rel of walk("src", [".ts"])) {
+      // The repository DEFINES these (their SQL shape is asserted by
+      // contract:verify 15c/15d); we scan the CALL sites in the workers.
+      if (rel === "src/db/repositories.ts") continue;
+      const lines = codeLines(read(rel));
+      for (let i = 0; i < lines.length; i++) {
+        if (!CALL.test(lines[i]!)) continue;
+        const window = lines.slice(i, i + 8).join("\n");
+        expect(
+          /generation/i.test(window),
+          `unfenced markCompleted/markFailed (no generation) in ${rel} near: ${lines[i]!.trim()}`,
+        ).toBe(true);
+      }
+    }
+  });
+});
