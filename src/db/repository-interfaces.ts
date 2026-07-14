@@ -1,12 +1,13 @@
 import type {
   DraftMirrorRow,
-  DraftVersionRow,
   FolderRole,
   MailboxFolderRow,
   MailboxRow,
   MailMessageMeta,
+  MirrorSnapshotRow,
   SendAttemptRow,
   SendIntentRow,
+  SendSnapshotRow,
   StoredCredential,
   SyncRequestRow,
 } from "../domain/models.js";
@@ -88,18 +89,30 @@ export interface DraftMirrorStore {
 }
 
 /**
- * SELECT-only lookup of the immutable draft snapshot for an EXACT confirmed
- * revision (public.draft_versions). Returns the highest version_no when
- * several snapshots share the same source_revision, and null when no snapshot
- * exists for that exact revision — the caller must fail CLOSED (checkpoints
- * are not guaranteed for every revision; a near-miss is never substituted).
+ * The worker's ONLY read path for confirmed SEND content: the private
+ * transport.get_send_snapshot(send_intent_id) accessor. It returns the exact
+ * draft_versions snapshot bound to the intent, or raises P0002 (mapped here to
+ * a content-free SnapshotUnavailableError) for a missing/legacy/inconsistent
+ * intent. It NEVER returns null and NEVER reads the mutable draft, a near-miss
+ * revision, or a caller-supplied snapshot id — the intent id is the sole key.
  */
-export interface DraftVersionReader {
-  findDraftVersion(
+export interface SendSnapshotReader {
+  getSendSnapshot(sendIntentId: string): Promise<SendSnapshotRow>;
+}
+
+/**
+ * The worker's read path for MIRRORING a known revision: the private
+ * transport.get_mirror_snapshot(workspace_id, draft_id, source_revision)
+ * accessor. Returns the newest snapshot for that EXACT triple, or raises P0002
+ * (mapped to SnapshotUnavailableError) when none exists (including any workspace
+ * mismatch — the workspace is part of the exact-match key). Never used to send.
+ */
+export interface MirrorSnapshotReader {
+  getMirrorSnapshot(
     workspaceId: string,
     draftId: string,
     sourceRevision: bigint,
-  ): Promise<DraftVersionRow | null>;
+  ): Promise<MirrorSnapshotRow>;
 }
 
 export interface SendIntentReader {

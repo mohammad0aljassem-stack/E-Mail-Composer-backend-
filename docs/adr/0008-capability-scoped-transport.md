@@ -65,13 +65,15 @@ Sent copy are byte-identical and hash-equal (no rebuild, no drifting
 ### 5. draft_versions grant follow-up (C4 — pre-Gate-G prerequisite)
 
 The production send-payload resolver reconstructs confirmed payloads from the
-immutable `public.draft_versions` snapshots, but the canonical migrations
-grant `transport_worker` **no SELECT** on that table. Until an **additive
-UI-owned grant migration** (`GRANT SELECT ON public.draft_versions TO
-transport_worker`, via the canonical manifest workflow) lands, the resolver
-fails closed (`draft_version_unreadable`) and the draft mirror skips closed.
-This is recorded as a Gate C grant item and a hard Gate G prerequisite in
-docs/phase-3b-runbook.md — never an ad-hoc statement from this repo.
+immutable `public.draft_versions` snapshots, but the worker has **no table
+grant** on `public.draft_versions`. Instead it resolves confirmed content
+(contract v2) by `send_intent_id` through the private `SECURITY DEFINER`
+accessor `transport.get_send_snapshot(uuid)` (and mirroring through
+`transport.get_mirror_snapshot(uuid,uuid,bigint)`), on which the canonical
+chain grants it `EXECUTE`. A missing/legacy/inconsistent intent raises a
+uniform `P0002`, so the resolver fails closed (`snapshot_unavailable`) and the
+draft mirror skips closed — with no direct-table read and no extra grant
+prerequisite.
 
 ### 6. IDLE + periodic fallback coordinator (C7)
 

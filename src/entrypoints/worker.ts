@@ -18,13 +18,14 @@ import {
   AuditRepository,
   CredentialRepository,
   DraftMirrorRepository,
-  DraftVersionRepository,
   FolderRepository,
   HeartbeatRepository,
   MailboxRepository,
   MessageRepository,
+  MirrorSnapshotRepository,
   SendAttemptRepository,
   SendIntentRepository,
+  SendSnapshotRepository,
   SyncRequestRepository,
   WorkerClaimRepository,
 } from "../db/repositories.js";
@@ -258,12 +259,13 @@ async function main(): Promise<void> {
         // body from the immutable public.draft_versions snapshot (exact
         // source_revision) + the deterministic worker renderer; the executor
         // re-verifies the intent hashes before any SMTP byte. Constructed
-        // ONLY inside this sendEnabled-gated branch. NOTE: the canonical
-        // migrations grant transport_worker no SELECT on draft_versions yet,
-        // so until a future additive UI grant migration lands this resolver
-        // fails CLOSED (`draft_version_unreadable`) under the real role.
+        // ONLY inside this sendEnabled-gated branch. The confirmed snapshot is
+        // resolved by send_intent_id through the PRIVATE
+        // transport.get_send_snapshot function (the worker has EXECUTE on it
+        // and no draft_versions table grant); it fails CLOSED
+        // (`snapshot_unavailable`) for a missing/legacy/inconsistent intent.
         payloadResolver: new DraftVersionSendPayloadResolver({
-          draftVersions: new DraftVersionRepository(db),
+          sendSnapshots: new SendSnapshotRepository(db),
         }),
         clock,
         logger,
@@ -334,16 +336,17 @@ async function main(): Promise<void> {
       // its invariants (idempotent per draft+revision, stale-revision
       // rejection, append-before-retire, UIDVALIDITY-namespaced UIDs) and is
       // IMAP-only: it never creates a send intent and never constructs SMTP.
-      // The payload resolver reads the SAME immutable draft_versions
-      // snapshots + deterministic renderer as the send path and fails closed
-      // (skipped_missing_payload) when the exact revision is unavailable.
+      // The payload resolver reads the confirmed snapshot via the PRIVATE
+      // transport.get_mirror_snapshot function (same renderer as the send path)
+      // and fails closed (skipped_missing_payload) when the exact revision is
+      // unavailable.
       const mirrorExec = new DraftMirrorExecutor({
         mailboxes: new MailboxRepository(db),
         mirrors: new DraftMirrorRepository(db),
         audit: new AuditRepository(db),
         providerFactory,
         payloadResolver: new DraftVersionMirrorPayloadResolver({
-          draftVersions: new DraftVersionRepository(db),
+          mirrorSnapshots: new MirrorSnapshotRepository(db),
           mailboxes: new MailboxRepository(db),
         }),
         logger,

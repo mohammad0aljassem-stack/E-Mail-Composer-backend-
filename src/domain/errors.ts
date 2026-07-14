@@ -29,6 +29,7 @@ export type TransportErrorCode =
   | "send_precondition_failed"
   | "send_ambiguous"
   | "send_pre_data_failed"
+  | "snapshot_unavailable"
   | "state_conflict"
   | "not_found"
   | "provisioning_refused";
@@ -55,6 +56,25 @@ export class TransportError extends Error {
     this.code = code;
     this.retryable = options?.retryable ?? false;
     this.context = Object.freeze({ ...(options?.context ?? {}) });
+  }
+}
+
+/**
+ * The private snapshot accessor (transport.get_send_snapshot /
+ * transport.get_mirror_snapshot) refused to return a snapshot: the intent is
+ * missing, legacy (proof-v1 / contract != 2), or its bound draft_versions row is
+ * missing/inconsistent — the function raises a single uniform P0002 for all of
+ * them, so the worker cannot (and must not) tell which. Content-free by
+ * construction: it names no column, body, or identifier. Fail-closed — the send
+ * path never constructs SMTP, the mirror path skips.
+ */
+export class SnapshotUnavailableError extends TransportError {
+  public constructor(context?: Record<string, string | number | boolean>) {
+    super("snapshot_unavailable", "confirmed snapshot not available", {
+      retryable: false,
+      ...(context !== undefined ? { context } : {}),
+    });
+    this.name = "SnapshotUnavailableError";
   }
 }
 
