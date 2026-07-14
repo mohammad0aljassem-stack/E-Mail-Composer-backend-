@@ -3,6 +3,7 @@ import type {
   MailboxFolderRow,
   MailboxRow,
   MailMessageMeta,
+  MimeArtifactRow,
   MirrorSnapshotRow,
   SendAttemptRow,
   SendIntentRow,
@@ -10,7 +11,10 @@ import type {
   StoredCredential,
   SyncRequestRow,
 } from "../domain/models.js";
-import { SnapshotUnavailableError } from "../domain/errors.js";
+import {
+  MimeArtifactError,
+  SnapshotUnavailableError,
+} from "../domain/errors.js";
 import type { SendState } from "../domain/send-state.js";
 import type {
   AuditWriter,
@@ -20,6 +24,7 @@ import type {
   HeartbeatWriter,
   MailboxReader,
   MessageStore,
+  MimeArtifactStore,
   MirrorSnapshotReader,
   SendAttemptStore,
   SendIntentReader,
@@ -616,6 +621,90 @@ export class SendAttemptRepository implements SendAttemptStore {
       smtpResponse: (row.smtp_response as string | null) ?? null,
       evidence: (row.evidence as SendAttemptRow["evidence"]) ?? {},
       version: req(row.version),
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Exact MIME artifacts (PRIVATE transport schema; worker EXECUTE + SELECT/UPDATE)
+// ---------------------------------------------------------------------------
+/**
+ * The worker's exact-MIME-artifact store. Creation goes EXCLUSIVELY through the
+ * SECURITY DEFINER function transport.create_or_verify_send_mime_artifact (the
+ * worker has EXECUTE on it and NO direct INSERT — the function INSERTs as its
+ * definer): this class issues NO direct INSERT on the table.
+ * The function first-creates the artifact only while the attempt is 'claimed'
+ * and re-hashes the caller bytes on every call, VERIFYING on a second identical
+ * call (restart/reconciliation); a uniform 23514 becomes a content-free
+ * MimeArtifactError. `getBySendAttempt` is a plain SELECT (worker grant) that
+ * loads the EXACT stored bytes for the Sent-copy append on restart.
+ */
+export class MimeArtifactRepository implements MimeArtifactStore {
+  public constructor(private readonly db: Queryable) {}
+
+  public async createOrVerify(input: {
+    sendAttemptId: string;
+    sendIntentId: string;
+    workspaceId: string;
+    messageId: string;
+    mimeSha256: string;
+    sizeBytes: bigint;
+    rawMime: Buffer;
+  }): Promise<MimeArtifactRow> {
+    let r;
+    try {
+      r = await this.db.query(
+        `select id, send_attempt_id, send_intent_id, workspace_id, message_id,
+                mime_sha256, size_bytes, raw_mime, cleared_at
+           from transport.create_or_verify_send_mime_artifact(
+             $1, $2, $3, $4, $5, $6, $7)`,
+        [
+          input.sendAttemptId,
+          input.sendIntentId,
+          input.workspaceId,
+          input.messageId,
+          input.mimeSha256,
+          input.sizeBytes.toString(),
+          input.rawMime,
+        ],
+      );
+    } catch (err) {
+      // The function raises a uniform, non-disclosing 23514 for every
+      // create/verify rejection. Map ONLY that to a content-free error; never
+      // surface the driver message.
+      if (isPgError(err, "23514")) throw new MimeArtifactError();
+      throw err;
+    }
+    const row = r.rows[0];
+    if (row === undefined) throw new MimeArtifactError();
+    return this.map(row);
+  }
+
+  public async getBySendAttempt(
+    sendAttemptId: string,
+  ): Promise<MimeArtifactRow | null> {
+    const r = await this.db.query(
+      `select id, send_attempt_id, send_intent_id, workspace_id, message_id,
+              mime_sha256, size_bytes, raw_mime, cleared_at
+         from transport.send_mime_artifacts
+        where send_attempt_id = $1`,
+      [sendAttemptId],
+    );
+    const row = r.rows[0];
+    return row === undefined ? null : this.map(row);
+  }
+
+  private map(row: Record<string, unknown>): MimeArtifactRow {
+    return {
+      id: row.id as string,
+      sendAttemptId: row.send_attempt_id as string,
+      sendIntentId: row.send_intent_id as string,
+      workspaceId: row.workspace_id as string,
+      messageId: row.message_id as string,
+      mimeSha256: row.mime_sha256 as string,
+      sizeBytes: req(row.size_bytes),
+      rawMime: (row.raw_mime as Buffer | null) ?? null,
+      clearedAt: date(row.cleared_at),
     };
   }
 }

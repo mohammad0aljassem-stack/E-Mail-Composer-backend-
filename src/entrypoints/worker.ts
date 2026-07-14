@@ -22,6 +22,7 @@ import {
   HeartbeatRepository,
   MailboxRepository,
   MessageRepository,
+  MimeArtifactRepository,
   MirrorSnapshotRepository,
   SendAttemptRepository,
   SendIntentRepository,
@@ -254,6 +255,12 @@ async function main(): Promise<void> {
         folders: new FolderRepository(db),
         claims: workerClaims,
         audit: new AuditRepository(db),
+        // Phase 6: the exact-MIME artifact store. Wired ONLY inside this
+        // sendEnabled-gated branch (matching the capability gating). Creation
+        // is EXECUTE-only on transport.create_or_verify_send_mime_artifact (the
+        // worker has NO direct INSERT); SELECT loads the exact stored bytes on
+        // restart for the Sent-copy append.
+        mimeArtifacts: new MimeArtifactRepository(db),
         providerFactory,
         // Phase 3B C4: the production resolver reconstructs the confirmed
         // body from the immutable public.draft_versions snapshot (exact

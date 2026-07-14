@@ -167,6 +167,30 @@ export interface SendAttemptRow {
   version: bigint;
 }
 
+/**
+ * Phase 3B (PRIVATE): the EXACT raw MIME bytes handed to SMTP for one
+ * send_attempt (transport.send_mime_artifacts), bound by sha256 + size and
+ * verified against the attempt/intent/workspace/message_id chain. First-created
+ * ONLY while the attempt is 'claimed' — before any SMTP byte — through the
+ * SECURITY DEFINER function transport.create_or_verify_send_mime_artifact (the
+ * worker holds NO direct INSERT). `rawMime` is present while retained and NULL
+ * once cleared for retention (after a terminal-for-delivery state); the durable
+ * proof (mimeSha256/sizeBytes/messageId) survives clearing. The worker uses the
+ * stored bytes verbatim for the Sent-folder append on restart/reconciliation —
+ * it never rebuilds MIME after acceptance.
+ */
+export interface MimeArtifactRow {
+  id: string;
+  sendAttemptId: string;
+  sendIntentId: string;
+  workspaceId: string;
+  messageId: string;
+  mimeSha256: string;
+  sizeBytes: bigint;
+  rawMime: Buffer | null;
+  clearedAt: Date | null;
+}
+
 export interface StoredCredential {
   id: string;
   mailboxId: string;

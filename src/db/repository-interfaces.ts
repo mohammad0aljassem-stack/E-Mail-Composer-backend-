@@ -4,6 +4,7 @@ import type {
   MailboxFolderRow,
   MailboxRow,
   MailMessageMeta,
+  MimeArtifactRow,
   MirrorSnapshotRow,
   SendAttemptRow,
   SendIntentRow,
@@ -135,6 +136,32 @@ export interface SendAttemptStore {
       evidence?: Record<string, string | number | boolean>;
     };
   }): Promise<SendAttemptRow | null>;
+}
+
+/**
+ * The worker's exact-MIME-artifact store (transport.send_mime_artifacts). The
+ * worker has EXECUTE on transport.create_or_verify_send_mime_artifact (a SECURITY
+ * DEFINER function that INSERTs as its definer) plus SELECT/UPDATE on the table —
+ * it holds NO direct INSERT and NEVER runs `insert into
+ * transport.send_mime_artifacts`. `createOrVerify` is the sole write path: it
+ * first-creates the artifact while the attempt is 'claimed' (before any SMTP
+ * byte) and, on a second identical call, VERIFIES the stored row for
+ * restart/reconciliation, always re-hashing the caller's bytes. A uniform 23514
+ * from the function maps to a content-free MimeArtifactError. `getBySendAttempt`
+ * loads the EXACT stored bytes on restart so the Sent-copy append reuses them —
+ * the worker never rebuilds MIME after acceptance.
+ */
+export interface MimeArtifactStore {
+  createOrVerify(input: {
+    sendAttemptId: string;
+    sendIntentId: string;
+    workspaceId: string;
+    messageId: string;
+    mimeSha256: string;
+    sizeBytes: bigint;
+    rawMime: Buffer;
+  }): Promise<MimeArtifactRow>;
+  getBySendAttempt(sendAttemptId: string): Promise<MimeArtifactRow | null>;
 }
 
 export interface WorkerClaimStore {
