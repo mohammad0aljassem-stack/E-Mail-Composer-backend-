@@ -964,7 +964,7 @@ export class SyncRequestRepository implements SyncRequestStore {
  * boundary too (belt and suspenders with the DB CHECK <= 2000): a short code
  * only, never any body/MIME/credential/provider payload.
  */
-function boundedCode(code: string): string {
+export function boundedCode(code: string): string {
   return code.slice(0, 200);
 }
 
