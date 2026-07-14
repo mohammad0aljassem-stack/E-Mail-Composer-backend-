@@ -210,23 +210,39 @@ d("durable sync_requests — lease, stale reclaim, terminal states", () => {
     expect((row?.lastError ?? "").length).toBeLessThanOrEqual(2000);
   });
 
-  it("markCompleted and markFailed advance from claimed only", async () => {
+  it("markCompleted and markFailed advance from claimed only, fenced on generation+token", async () => {
     const ctx = await seedContext(admin);
     const id = await seedClaimed(ctx, { claimedAgoMs: 1000, attemptCount: 1 });
     const repo = new SyncRequestRepository(worker);
-    const done = await repo.markCompleted(id, new Date());
+    const row = await repo.getById(id);
+    const gen = row!.attemptCount;
+    const token = row!.claimedAt!;
+    // A WRONG generation or token cannot complete (fenced CAS).
+    expect(await repo.markCompleted(id, gen + 1, token, new Date())).toBeNull();
+    expect(
+      await repo.markCompleted(
+        id,
+        gen,
+        new Date(token.getTime() + 1),
+        new Date(),
+      ),
+    ).toBeNull();
+    const done = await repo.markCompleted(id, gen, token, new Date());
     expect(done?.status).toBe("completed");
     expect(done?.completedAt).not.toBeNull();
     // Idempotent: a second completion is a no-op (not claimed anymore).
-    expect(await repo.markCompleted(id, new Date())).toBeNull();
+    expect(await repo.markCompleted(id, gen, token, new Date())).toBeNull();
 
     const id2 = await seedClaimed(ctx, {
       claimedAgoMs: 1000,
       attemptCount: 1,
       folder: "INBOX",
     });
+    const row2 = await repo.getById(id2);
     const failed = await repo.markFailed({
       id: id2,
+      expectedGeneration: row2!.attemptCount,
+      expectedToken: row2!.claimedAt!,
       now: new Date(),
       lastError: "sync_failed",
     });

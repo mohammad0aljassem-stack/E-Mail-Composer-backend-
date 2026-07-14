@@ -74,10 +74,12 @@ export class QueueManager {
 
   /**
    * Enqueue a sync_mailbox job that originated from a durable
-   * transport.sync_requests row. The singletonKey is DETERMINISTIC in the
-   * durable request id (not mailbox+folder), so re-dispatch after a crash / lease
-   * expiry can never create a duplicate job for the same request. Per-workspace
-   * fair concurrency is preserved via the pg-boss job group.
+   * transport.sync_requests row. The singletonKey is GENERATION-SCOPED in the
+   * durable request id AND the claim generation (not mailbox+folder), so a
+   * re-dispatch WITHIN a generation dedups, while a reclaim (new generation)
+   * mints a fresh key; the fenced CAS (generation + token) — not the key — is
+   * what keeps at most one claimant effective. Per-workspace fair concurrency is
+   * preserved via the pg-boss job group.
    */
   public async enqueueSyncForRequest(
     job: SyncMailboxJob & { syncRequestId: string },
@@ -86,7 +88,10 @@ export class QueueManager {
       QUEUE_NAMES.syncMailbox,
       { ...job },
       {
-        singletonKey: singletonKeys.syncRequest(job.syncRequestId),
+        singletonKey: singletonKeys.syncRequest(
+          job.syncRequestId,
+          job.claimGeneration!,
+        ),
         group: { id: job.workspaceId },
       },
     );
@@ -95,11 +100,13 @@ export class QueueManager {
   /**
    * Enqueue the CONTINUATION of a durable multi-batch sync request: the in-job
    * batch loop hit its bound while the executor still reports needsFollowUp.
-   * The job payload carries the SAME syncRequestId (every continuation stays
-   * associated with the original durable request); the singletonKey is
-   * deterministic in (request id, cursor position) so it can never collide with
-   * the original `sync-req:{id}` dispatch key, and a crash-recovery duplicate
-   * of the same continuation dedups to null (see singletonKeys).
+   * The job payload carries the SAME syncRequestId AND the SAME fencing tuple
+   * (claimGeneration + claimToken), so the continuation job stays fenced within
+   * the generation; only `cursorUid` is stripped from the payload (it lives in
+   * the key). The singletonKey is generation-scoped in (request id, generation,
+   * cursor position) so it can never collide with the generation's
+   * `sync-req:{id}:gen:{g}` dispatch key, and a crash-recovery duplicate of the
+   * same continuation dedups to null (see singletonKeys).
    */
   public async enqueueSyncContinuation(
     job: SyncMailboxJob & { syncRequestId: string; cursorUid: string },
@@ -111,6 +118,7 @@ export class QueueManager {
       {
         singletonKey: singletonKeys.syncRequestContinuation(
           job.syncRequestId,
+          job.claimGeneration!,
           cursorUid,
         ),
         group: { id: job.workspaceId },

@@ -191,6 +191,10 @@ async function main(): Promise<void> {
                     folder: continuation.folder,
                     mode: continuation.mode,
                     syncRequestId: continuation.syncRequestId,
+                    // Carry the fencing tuple so the continuation job stays
+                    // fenced within the SAME generation (payload + singleton key).
+                    claimGeneration: continuation.claimGeneration,
+                    claimToken: continuation.claimToken,
                     cursorUid: continuation.cursorUid,
                   }),
                 enqueueFollowUp: (followUp) => queues.enqueueSync(followUp),

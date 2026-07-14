@@ -841,23 +841,27 @@ export class SyncRequestRepository implements SyncRequestStore {
   }
 
   /**
-   * Fenced lease renewal (single atomic CAS on claimed_at). Succeeds ONLY when
-   * the row is still `claimed` AND claimed_at equals the exact token the caller
-   * holds; a lost CAS (another claimant re-claimed, or the request went
-   * terminal) returns null and the caller must stop without marking anything.
-   * attempt_count is deliberately NOT touched: renewals are not re-claims.
+   * Fenced lease renewal (single atomic CAS on the generation+token tuple).
+   * Succeeds ONLY when the row is still `claimed` AND attempt_count equals the
+   * generation the caller holds AND claimed_at equals the exact token the caller
+   * holds; a lost CAS (another claimant re-claimed — bumping generation and/or
+   * moving the token — or the request went terminal) returns null and the caller
+   * must stop without marking anything. attempt_count is deliberately NOT touched:
+   * renewals are not re-claims (the generation is unchanged; only the token moves).
    */
   public async renewLease(
     id: string,
+    expectedGeneration: number,
     prevClaimedAt: Date,
     now: Date,
   ): Promise<Date | null> {
     const r = await this.db.query(
       `update transport.sync_requests
-          set claimed_at = $3
-        where id = $1 and status = 'claimed' and claimed_at = $2
+          set claimed_at = $4
+        where id = $1 and status = 'claimed'
+          and attempt_count = $2 and claimed_at = $3
       returning claimed_at`,
-      [id, prevClaimedAt, now],
+      [id, expectedGeneration, prevClaimedAt, now],
     );
     const row = r.rows[0];
     return row === undefined ? null : date(row.claimed_at);
@@ -865,14 +869,17 @@ export class SyncRequestRepository implements SyncRequestStore {
 
   public async markCompleted(
     id: string,
+    expectedGeneration: number,
+    expectedToken: Date,
     now: Date,
   ): Promise<SyncRequestRow | null> {
     const r = await this.db.query(
       `update transport.sync_requests
-          set status = 'completed', completed_at = $2
+          set status = 'completed', completed_at = $4
         where id = $1 and status = 'claimed'
+          and attempt_count = $2 and claimed_at = $3
       returning *`,
-      [id, now],
+      [id, expectedGeneration, expectedToken, now],
     );
     const row = r.rows[0];
     return row === undefined ? null : this.map(row);
@@ -880,15 +887,24 @@ export class SyncRequestRepository implements SyncRequestStore {
 
   public async markFailed(input: {
     id: string;
+    expectedGeneration: number;
+    expectedToken: Date;
     now: Date;
     lastError: string;
   }): Promise<SyncRequestRow | null> {
     const r = await this.db.query(
       `update transport.sync_requests
-          set status = 'failed', completed_at = $2, last_error = $3
-        where id = $1 and status in ('claimed', 'pending')
+          set status = 'failed', completed_at = $4, last_error = $5
+        where id = $1 and status = 'claimed'
+          and attempt_count = $2 and claimed_at = $3
       returning *`,
-      [input.id, input.now, boundedCode(input.lastError)],
+      [
+        input.id,
+        input.expectedGeneration,
+        input.expectedToken,
+        input.now,
+        boundedCode(input.lastError),
+      ],
     );
     const row = r.rows[0];
     return row === undefined ? null : this.map(row);

@@ -198,6 +198,18 @@ export interface HeartbeatWriter {
  * method is a single atomic statement; `claimBatch` is a concurrency-safe
  * `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED)` so at most one
  * worker claims any one request.
+ *
+ * FENCING TUPLE (generation + token; NO schema change): a claimant "owns" a
+ * request iff, in a single atomic CAS, the row is still `status = 'claimed'`
+ * AND `attempt_count = expectedGeneration` AND `claimed_at = expectedToken`.
+ *   - `claimGeneration` = `attempt_count` at claim time. It advances by exactly
+ *     1 on each durable (re)claim via `claimBatch` — never on renew, on a
+ *     continuation job, or on a pg-boss retry.
+ *   - `claimToken` = `claimed_at` at claim time. It moves on every claim AND on
+ *     every successful `renewLease`.
+ * A stale/superseded claimant (a dead generation, or a token another renewal
+ * moved) fails every CAS — renewLease/markCompleted/markFailed all return null —
+ * and MUST stop, marking nothing, opening no IMAP connection.
  */
 export interface SyncRequestStore {
   /**
@@ -205,7 +217,9 @@ export interface SyncRequestStore {
    * `claimed` whose `claimedAt < leaseCutoff` (a STALE claim past the lease —
    * reclaimable crash recovery) AND `attemptCount < maxAttempts`. Each claimed
    * row moves to `claimed`, sets `claimedAt = now`, and increments
-   * `attemptCount`. A FRESH claim (recent `claimedAt`) is never stolen.
+   * `attemptCount`. The incremented `attemptCount` is the claim's GENERATION and
+   * `claimedAt = now` is its TOKEN. A FRESH claim (recent `claimedAt`) is never
+   * stolen.
    */
   claimBatch(input: {
     limit: number;
@@ -218,24 +232,46 @@ export interface SyncRequestStore {
    * Fenced lease renewal for an in-flight claim (single-claimant guarantee,
    * no schema change): a single CAS statement
    * `UPDATE ... SET claimed_at = now WHERE id AND status = 'claimed' AND
-   * claimed_at = prevClaimedAt RETURNING claimed_at`. Returns the NEW
-   * `claimedAt` (the next fencing token) or null when the lease was lost —
-   * another claimant re-claimed the row (its claimed_at moved) or the request
-   * reached a terminal state. `prevClaimedAt` MUST be the exact Date previously
-   * returned by claimBatch/getById/renewLease (Postgres timestamptz keeps the
+   * attempt_count = expectedGeneration AND claimed_at = prevClaimedAt
+   * RETURNING claimed_at`. Generation is UNCHANGED by a renewal (renewals are
+   * not re-claims). Returns the NEW `claimedAt` (the next fencing token) or null
+   * when the lease was lost — another claimant re-claimed the row (generation
+   * and/or token moved) or the request reached a terminal state. `prevClaimedAt`
+   * MUST be the exact Date previously returned by claimBatch/renewLease or
+   * parsed from the job payload's `claimToken` (Postgres timestamptz keeps the
    * millisecond value exactly; never a re-derived timestamp).
    */
-  renewLease(id: string, prevClaimedAt: Date, now: Date): Promise<Date | null>;
-
-  /** Terminal success: `claimed -> completed`, set `completedAt`. Idempotent. */
-  markCompleted(id: string, now: Date): Promise<SyncRequestRow | null>;
+  renewLease(
+    id: string,
+    expectedGeneration: number,
+    prevClaimedAt: Date,
+    now: Date,
+  ): Promise<Date | null>;
 
   /**
-   * Terminal failure: `claimed|pending -> failed`, set `completedAt` and a
-   * bounded, content-free `lastError` code. Idempotent.
+   * Fenced terminal success: `claimed -> completed`, set `completedAt`, ONLY
+   * when `attempt_count = expectedGeneration` AND `claimed_at = expectedToken`.
+   * A lost CAS (another generation took over) returns null — a silent no-op.
+   * Idempotent within the owning generation.
+   */
+  markCompleted(
+    id: string,
+    expectedGeneration: number,
+    expectedToken: Date,
+    now: Date,
+  ): Promise<SyncRequestRow | null>;
+
+  /**
+   * Fenced terminal failure: `claimed -> failed`, set `completedAt` and a
+   * bounded, content-free `lastError` code, ONLY when `attempt_count =
+   * expectedGeneration` AND `claimed_at = expectedToken`. Every legitimate
+   * terminal-fail caller holds a live claim, so there is no `pending` allowance;
+   * the unfenced terminal bound is `reapExhausted`. A lost CAS returns null.
    */
   markFailed(input: {
     id: string;
+    expectedGeneration: number;
+    expectedToken: Date;
     now: Date;
     lastError: string;
   }): Promise<SyncRequestRow | null>;
@@ -243,7 +279,7 @@ export interface SyncRequestStore {
   /**
    * Sweep STALE `claimed` rows whose `attemptCount >= maxAttempts` to `failed`
    * with a bounded content-free code. Returns the number reaped. This is the
-   * terminal bound on durable re-claims.
+   * terminal bound on durable re-claims (the only UNFENCED terminal write).
    */
   reapExhausted(input: {
     now: Date;

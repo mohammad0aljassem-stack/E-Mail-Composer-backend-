@@ -627,11 +627,13 @@ export class FakeSyncRequestRepo implements SyncRequestStore {
 
   /**
    * Fenced lease renewal — same CAS semantics as the SQL implementation:
-   * succeeds only while status='claimed' AND claimed_at equals the exact token
-   * the caller holds; never touches attempt_count.
+   * succeeds only while status='claimed' AND attempt_count equals the generation
+   * the caller holds AND claimed_at equals the exact token the caller holds;
+   * never touches attempt_count.
    */
   public renewLease(
     id: string,
+    expectedGeneration: number,
     prevClaimedAt: Date,
     now: Date,
   ): Promise<Date | null> {
@@ -639,6 +641,7 @@ export class FakeSyncRequestRepo implements SyncRequestStore {
     if (
       r === undefined ||
       r.status !== "claimed" ||
+      r.attemptCount !== expectedGeneration ||
       r.claimedAt === null ||
       r.claimedAt.getTime() !== prevClaimedAt.getTime()
     ) {
@@ -648,9 +651,22 @@ export class FakeSyncRequestRepo implements SyncRequestStore {
     return Promise.resolve(now);
   }
 
-  public markCompleted(id: string, now: Date): Promise<SyncRequestRow | null> {
+  public markCompleted(
+    id: string,
+    expectedGeneration: number,
+    expectedToken: Date,
+    now: Date,
+  ): Promise<SyncRequestRow | null> {
     const r = this.rows.get(id);
-    if (r === undefined || r.status !== "claimed") return Promise.resolve(null);
+    if (
+      r === undefined ||
+      r.status !== "claimed" ||
+      r.attemptCount !== expectedGeneration ||
+      r.claimedAt === null ||
+      r.claimedAt.getTime() !== expectedToken.getTime()
+    ) {
+      return Promise.resolve(null);
+    }
     const updated: SyncRequestRow = {
       ...r,
       status: "completed",
@@ -662,11 +678,19 @@ export class FakeSyncRequestRepo implements SyncRequestStore {
 
   public markFailed(input: {
     id: string;
+    expectedGeneration: number;
+    expectedToken: Date;
     now: Date;
     lastError: string;
   }): Promise<SyncRequestRow | null> {
     const r = this.rows.get(input.id);
-    if (r === undefined || (r.status !== "claimed" && r.status !== "pending")) {
+    if (
+      r === undefined ||
+      r.status !== "claimed" ||
+      r.attemptCount !== input.expectedGeneration ||
+      r.claimedAt === null ||
+      r.claimedAt.getTime() !== input.expectedToken.getTime()
+    ) {
       return Promise.resolve(null);
     }
     const updated: SyncRequestRow = {

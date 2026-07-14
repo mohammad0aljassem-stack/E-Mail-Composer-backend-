@@ -15,8 +15,19 @@ import type { SyncMailboxJob } from "../queues/queue-config.js";
  * durable, deduped, claimable row (the worker has SELECT + UPDATE only — never
  * INSERT/DELETE). This dispatcher is the ONLY consumer: it atomically claims
  * pending / stale-reclaimable rows and enqueues a `sync_mailbox` pg-boss job
- * with a DETERMINISTIC key derived from the durable request id. It never polls
+ * under a GENERATION-SCOPED key (request id + claim generation). It never polls
  * transport_audit (that is not a queue) and never creates pg-boss jobs from SQL.
+ *
+ * DURABLE FENCING TUPLE (generation + token; no schema change): each claim
+ * carries a two-part fence — the GENERATION (`attempt_count` at claim time,
+ * bumped +1 by claimBatch on every durable (re)claim, never by renew/
+ * continuation/pg-boss-retry) and the TOKEN (`claimed_at` at claim time, moved
+ * by every claim AND every successful renewLease). A claimant owns the request
+ * iff a single atomic CAS finds status='claimed' AND attempt_count=generation
+ * AND claimed_at=token. A superseded claimant (dead generation, or a token a
+ * newer renewal moved) fails EVERY CAS and stops, marking nothing, opening no
+ * IMAP connection. The tuple is carried on the job payload (claimGeneration +
+ * claimToken) so the lifecycle fences without re-reading the row.
  *
  * STATE DIAGRAM (durable row):
  *
@@ -45,24 +56,28 @@ import type { SyncMailboxJob } from "../queues/queue-config.js";
  *     intentionally NOT nulled on completion/failure (last-claim timestamp,
  *     retained for audit).
  *
- * IN-JOB BATCH LOOP + LEASE RENEWAL FENCING (see workers/sync-lifecycle.ts):
+ * IN-JOB BATCH LOOP + FENCED OWNERSHIP (see workers/sync-lifecycle.ts):
  *   The sync_mailbox handler runs up to SYNC_MAX_BATCHES_PER_JOB executor
- *   batches inside ONE job. Between batches it renews the durable lease with a
- *   fenced CAS: `UPDATE ... SET claimed_at=now WHERE id AND status='claimed'
- *   AND claimed_at=<the exact Date the claimant holds>`. The claimed_at value
- *   is the fencing token — a reclaim moves it, so a stale claimant's next CAS
- *   fails (null) and it stops WITHOUT marking anything. At most one claimant
- *   is ever effective, with no schema change.
+ *   batches inside ONE job. It asserts ownership with a fenced renewLease CAS
+ *   BEFORE EVERY batch (including the first): `UPDATE ... SET claimed_at=now
+ *   WHERE id AND status='claimed' AND attempt_count=<generation> AND
+ *   claimed_at=<the exact token the claimant holds>`. The generation is the
+ *   claim's attempt_count and the token is claimed_at — a reclaim bumps the
+ *   generation and moves the token, so a superseded claimant's CAS fails (null)
+ *   and it stops WITHOUT executing or marking anything (never opening IMAP). On
+ *   success the held token advances to the returned claimed_at. At most one
+ *   claimant is ever effective, with no schema change.
  *
  * CONTINUATION KEY (multi-batch backlog beyond the in-job bound):
- *   When the bound is hit while needsFollowUp is still true, the handler
- *   enqueues a continuation job that carries the SAME syncRequestId (every
- *   continuation stays associated with the original durable request) under
- *   singletonKey `sync-req:{id}:uid:{cursorUid}` (cursorUid = the folder
- *   cursor's lastSeenUid after the last completed batch). The key is
- *   cursor-distinct: it can NEVER collide with the original `sync-req:{id}`
- *   dispatch key, and a crash-recovery duplicate of the same continuation
- *   produces the SAME key.
+ *   When the bound is hit while needsFollowUp is still true, the handler first
+ *   re-asserts ownership (a fenced renewLease) and then enqueues a continuation
+ *   job that carries the SAME syncRequestId and the SAME claimGeneration (every
+ *   continuation stays associated with the original durable request AND its
+ *   generation) under singletonKey `sync-req:{id}:gen:{g}:uid:{cursorUid}`
+ *   (cursorUid = the folder cursor's lastSeenUid after the last completed batch).
+ *   The key is cursor-distinct within the generation: it can NEVER collide with
+ *   the generation's `sync-req:{id}:gen:{g}` dispatch key, and a crash-recovery
+ *   duplicate of the same continuation produces the SAME key.
  *
  * NULL-ENQUEUE BEHAVIOR (pg-boss singleton semantics):
  *   boss.send returns null when a job with the same singletonKey is already
@@ -88,11 +103,14 @@ import type { SyncMailboxJob } from "../queues/queue-config.js";
  *     (needsFollowUp=false) -> markCompleted. Bounded by attempt_count.
  *
  * DUPLICATE DISPATCH:
- *   A reclaim re-enqueues under the original deterministic `sync-req:{id}` key;
- *   while a queued (created-state) job holds that key the re-enqueue dedups to
- *   null. If a reclaimed dispatch job and a still-running (or continuation)
- *   job momentarily coexist, the renewLease CAS guarantees only ONE of them
- *   remains effective — the loser stops without marking anything.
+ *   A reclaim bumps the generation and re-enqueues under a NEW
+ *   `sync-req:{id}:gen:{g+1}` key, so it is intentionally NOT deduped against a
+ *   stale queued job from the dead generation g. WITHIN one generation,
+ *   re-dispatch / crash-recovery duplicates share the SAME key and dedup to
+ *   null. If a reclaimed dispatch job (generation g+1) and a still-running (or
+ *   continuation) job from generation g momentarily coexist, the fenced CAS
+ *   (generation + token) guarantees only ONE remains effective — the loser
+ *   stops without marking anything.
  *
  * MAX ATTEMPTS + interaction with sync_mailbox.retryLimit=5:
  *   Two INDEPENDENT layers that MUST NOT multiply into an undocumented count:
@@ -100,8 +118,9 @@ import type { SyncMailboxJob } from "../queues/queue-config.js";
  *       errors WITHIN a single durable claim. These do NOT touch attempt_count.
  *     - the durable attempt_count bounds *re-dispatch* (crash / lease expiry).
  *   Continuation jobs bypass claimBatch entirely (the request stays 'claimed';
- *   they renew the lease via the CAS using the claimed_at they read at start),
- *   so continuations NEVER consume the failure budget: attempt_count grows
+ *   they fence the lease via the CAS using the generation+token from their job
+ *   payload), so continuations NEVER consume the failure budget: attempt_count
+ *   grows
  *   only via dispatcher reclaims (crash / lease expiry) — bounded as before.
  *   In the absence of crashes a request is claimed ONCE and enqueued ONCE, so
  *   the execution count is bounded by 5 (pg-boss) — not maxAttempts × 5. A clean
@@ -234,11 +253,26 @@ export class SyncRequestDispatcher {
     row: SyncRequestRow,
     now: Date,
   ): Promise<boolean> {
+    // The just-claimed row always carries a non-null claimed_at from claimBatch,
+    // which is the fencing TOKEN; attempt_count is the fencing GENERATION. A null
+    // token would be a claim anomaly: we could not fence markFailed and must not
+    // open IMAP, so log content-free and skip (this should never happen).
+    const token = row.claimedAt;
+    if (token === null) {
+      this.deps.logger.error("sync_claim_anomaly", {
+        sync_request_id: row.id,
+      });
+      return false;
+    }
+
     const mailbox = await this.deps.mailboxes.getById(row.mailboxId);
     if (!this.syncable(mailbox)) {
       // Kill switch / disabled / missing mailbox: terminal, content-free, no IMAP.
+      // Fenced on the generation+token of the claim we just took.
       await this.deps.syncRequests.markFailed({
         id: row.id,
+        expectedGeneration: row.attemptCount,
+        expectedToken: token,
         now,
         lastError: CODE.mailboxUnsyncable,
       });
@@ -251,7 +285,10 @@ export class SyncRequestDispatcher {
 
     // Whole-mailbox (folder null) => an initial discovery pass; a folder-scoped
     // request => an incremental sync of that folder. Distinct durable rows/ids
-    // (per uq_sync_requests_open) map to distinct deterministic pg-boss keys.
+    // (per uq_sync_requests_open) map to distinct pg-boss keys. The job carries
+    // the fencing tuple (claimGeneration = attempt_count, claimToken = claimed_at
+    // as an ISO string) end-to-end, so the lifecycle can fence every batch,
+    // renewal, continuation, completion, and terminal failure against it.
     const isWholeMailbox = row.folder === null;
     const job: SyncMailboxJob & { syncRequestId: string } = {
       workspaceId: row.workspaceId,
@@ -259,26 +296,11 @@ export class SyncRequestDispatcher {
       folder: row.folder ?? "INBOX",
       mode: isWholeMailbox ? "initial" : "incremental",
       syncRequestId: row.id,
+      claimGeneration: row.attemptCount,
+      claimToken: token.toISOString(),
     };
     await this.deps.enqueueSync(job);
     return true;
-  }
-
-  /** Called by the sync_mailbox job handler on a successful sync. */
-  public async markCompleted(syncRequestId: string): Promise<void> {
-    await this.deps.syncRequests.markCompleted(
-      syncRequestId,
-      this.deps.clock.now(),
-    );
-  }
-
-  /** Called by the sync_mailbox job handler on a terminal (final) failure. */
-  public async markFailed(syncRequestId: string, code: string): Promise<void> {
-    await this.deps.syncRequests.markFailed({
-      id: syncRequestId,
-      now: this.deps.clock.now(),
-      lastError: code,
-    });
   }
 
   private syncable(mailbox: MailboxRow | null): mailbox is MailboxRow {
