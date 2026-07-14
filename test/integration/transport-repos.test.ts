@@ -7,6 +7,7 @@ import {
   DraftMirrorRepository,
   FolderRepository,
   MessageRepository,
+  MimeArtifactRepository,
   MirrorSnapshotRepository,
   SendAttemptRepository,
   SendSnapshotRepository,
@@ -14,6 +15,10 @@ import {
 } from "../../src/db/repositories.js";
 import { PgDatabase } from "../../src/db/pool.js";
 import { renderDraftBody } from "../../src/mime/draft-renderer.js";
+import {
+  buildOutboundMime,
+  sha256Hex,
+} from "../../src/mime/outbound-builder.js";
 import { DraftVersionSendPayloadResolver } from "../../src/workers/send-payload-resolver.js";
 import { HAS_DB, seedContext, superuserPool, WORKER_URL } from "./helpers.js";
 
@@ -434,6 +439,199 @@ d(
     });
   },
 );
+
+d("exact MIME artifacts (Phase 6, real v2 schema + worker grants)", () => {
+  let admin: pg.Pool;
+  let worker: PgDatabase;
+  beforeAll(() => {
+    admin = superuserPool();
+    worker = new PgDatabase({ connectionString: WORKER_URL });
+  });
+  afterAll(async () => {
+    await worker.end();
+    await admin.end();
+  });
+
+  /** Move a fresh (confirmed) attempt to 'claimed' as the worker. */
+  async function claim(attemptId: string): Promise<bigint> {
+    const repo = new SendAttemptRepository(worker);
+    await repo.compareAndSet({
+      id: attemptId,
+      expectedVersion: 1n,
+      expectedState: "confirmed",
+      toState: "queued",
+    });
+    const claimed = await repo.compareAndSet({
+      id: attemptId,
+      expectedVersion: 2n,
+      expectedState: "queued",
+      toState: "claimed",
+      fields: { claimedBy: "w-int", claimedAt: new Date() },
+    });
+    if (claimed === null) throw new Error("claim failed");
+    return claimed.version;
+  }
+
+  async function buildMimeFor(mId: string): Promise<Buffer> {
+    const built = await buildOutboundMime({
+      messageId: mId,
+      sender: "sender@test.local",
+      recipients: { to: ["r@test.local"] },
+      subject: "s",
+      html: "<p>hi</p>",
+      text: "hi",
+      attachments: [],
+    });
+    return built.raw;
+  }
+
+  // claimed -> createOrVerify (worker EXECUTE, no test-only grant) -> the
+  // claimed -> smtp_in_progress transition then SUCCEEDS with the artifact.
+  it("createOrVerify while claimed permits claimed -> smtp_in_progress", async () => {
+    const ctx = await seedContext(admin);
+    const { attemptId, messageId: mId } = await seedIntentAndAttempt(
+      admin,
+      ctx,
+    );
+    const intentId = (
+      await admin.query<{ send_intent_id: string }>(
+        `select send_intent_id from public.send_attempts where id = $1`,
+        [attemptId],
+      )
+    ).rows[0]!.send_intent_id;
+    const version = await claim(attemptId);
+    const raw = await buildMimeFor(mId);
+
+    const repo = new MimeArtifactRepository(worker);
+    const artifact = await repo.createOrVerify({
+      sendAttemptId: attemptId,
+      sendIntentId: intentId,
+      workspaceId: ctx.workspaceId,
+      messageId: mId,
+      mimeSha256: sha256Hex(raw),
+      sizeBytes: BigInt(raw.length),
+      rawMime: raw,
+    });
+    expect(artifact.rawMime).not.toBeNull();
+    expect(artifact.rawMime!.equals(raw)).toBe(true);
+    expect(artifact.mimeSha256).toBe(sha256Hex(raw));
+
+    // The DB ordering guard now passes because a valid retained artifact exists.
+    const moved = await new SendAttemptRepository(worker).compareAndSet({
+      id: attemptId,
+      expectedVersion: version,
+      expectedState: "claimed",
+      toState: "smtp_in_progress",
+      fields: { messageId: mId },
+    });
+    expect(moved?.state).toBe("smtp_in_progress");
+
+    // An identical create-or-verify replay returns the SAME artifact row.
+    const replay = await repo.createOrVerify({
+      sendAttemptId: attemptId,
+      sendIntentId: intentId,
+      workspaceId: ctx.workspaceId,
+      messageId: mId,
+      mimeSha256: sha256Hex(raw),
+      sizeBytes: BigInt(raw.length),
+      rawMime: raw,
+    });
+    expect(replay.id).toBe(artifact.id);
+  });
+
+  // The DB guard trg_send_attempts_require_mime_before_smtp REJECTS the
+  // transition (23514) when NO artifact was persisted.
+  it("claimed -> smtp_in_progress WITHOUT an artifact is rejected 23514 by the DB", async () => {
+    const ctx = await seedContext(admin);
+    const { attemptId, messageId: mId } = await seedIntentAndAttempt(
+      admin,
+      ctx,
+    );
+    const version = await claim(attemptId);
+    await expect(
+      new SendAttemptRepository(worker).compareAndSet({
+        id: attemptId,
+        expectedVersion: version,
+        expectedState: "claimed",
+        toState: "smtp_in_progress",
+        fields: { messageId: mId },
+      }),
+    ).rejects.toMatchObject({ code: "23514" });
+    // The attempt is untouched — still claimable for a proper artifact-first run.
+    const still = await new SendAttemptRepository(worker).getById(attemptId);
+    expect(still?.state).toBe("claimed");
+  });
+
+  // The worker holds NO direct INSERT on transport.send_mime_artifacts: a direct
+  // INSERT is denied (42501) even while the attempt is claimed.
+  it("the worker CANNOT direct-INSERT into transport.send_mime_artifacts (42501)", async () => {
+    const ctx = await seedContext(admin);
+    const { attemptId, messageId: mId } = await seedIntentAndAttempt(
+      admin,
+      ctx,
+    );
+    const intentId = (
+      await admin.query<{ send_intent_id: string }>(
+        `select send_intent_id from public.send_attempts where id = $1`,
+        [attemptId],
+      )
+    ).rows[0]!.send_intent_id;
+    await claim(attemptId);
+    const raw = await buildMimeFor(mId);
+    try {
+      await worker.query(
+        `insert into transport.send_mime_artifacts
+           (send_attempt_id, send_intent_id, workspace_id, message_id,
+            mime_sha256, size_bytes, raw_mime)
+         values ($1,$2,$3,$4,$5,$6,$7)`,
+        [
+          attemptId,
+          intentId,
+          ctx.workspaceId,
+          mId,
+          sha256Hex(raw),
+          raw.length,
+          raw,
+        ],
+      );
+      expect.unreachable("worker direct INSERT should be denied");
+    } catch (err) {
+      expect((err as { code?: string }).code).toBe("42501");
+    }
+  });
+
+  // getBySendAttempt loads the EXACT stored bytes for the restart Sent append.
+  it("getBySendAttempt returns the exact retained bytes", async () => {
+    const ctx = await seedContext(admin);
+    const { attemptId, messageId: mId } = await seedIntentAndAttempt(
+      admin,
+      ctx,
+    );
+    const intentId = (
+      await admin.query<{ send_intent_id: string }>(
+        `select send_intent_id from public.send_attempts where id = $1`,
+        [attemptId],
+      )
+    ).rows[0]!.send_intent_id;
+    await claim(attemptId);
+    const raw = await buildMimeFor(mId);
+    const repo = new MimeArtifactRepository(worker);
+    await repo.createOrVerify({
+      sendAttemptId: attemptId,
+      sendIntentId: intentId,
+      workspaceId: ctx.workspaceId,
+      messageId: mId,
+      mimeSha256: sha256Hex(raw),
+      sizeBytes: BigInt(raw.length),
+      rawMime: raw,
+    });
+    const loaded = await repo.getBySendAttempt(attemptId);
+    expect(loaded).not.toBeNull();
+    expect(loaded!.rawMime!.equals(raw)).toBe(true);
+    expect(loaded!.sizeBytes).toBe(BigInt(raw.length));
+    expect(sha256Hex(loaded!.rawMime!)).toBe(loaded!.mimeSha256);
+  });
+});
 
 d("confirmation-proof parity: SQL RPC vs TS re-derivation", () => {
   let admin: pg.Pool;

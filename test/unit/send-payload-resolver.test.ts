@@ -16,6 +16,7 @@ import {
   FakeAuditRepo,
   FakeFolderRepo,
   FakeMailboxRepo,
+  FakeMimeArtifactRepo,
   FakeSendAttemptRepo,
   FakeSendIntentRepo,
   FakeSendSnapshotRepo,
@@ -99,6 +100,13 @@ async function makeHarness(): Promise<Harness> {
   const attempts = new FakeSendAttemptRepo();
   attempts.rows.set(ATTEMPT_ID, fixture.attempt("confirmed"));
 
+  const mimeArtifacts = new FakeMimeArtifactRepo();
+  mimeArtifacts.attemptState = (id) => attempts.rows.get(id)?.state ?? null;
+  attempts.mimeArtifactGuard = (id) => {
+    const art = mimeArtifacts.rows.get(id);
+    return art !== undefined && art.rawMime !== null;
+  };
+
   const server = new FakeImapServer();
   server.addFolder({ name: "Sent", role: "sent" });
   const smtp = new FakeSmtpClient();
@@ -111,6 +119,7 @@ async function makeHarness(): Promise<Harness> {
     folders: new FakeFolderRepo(),
     claims: new FakeWorkerClaimRepo(),
     audit: new FakeAuditRepo(),
+    mimeArtifacts,
     providerFactory: factory,
     payloadResolver: new DraftVersionSendPayloadResolver({
       sendSnapshots: snapshots,

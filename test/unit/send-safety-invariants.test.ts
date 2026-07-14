@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
@@ -80,5 +80,59 @@ describe("B4 — the sender-authority guard precedes SMTP on the send path", () 
 
   it("the send executor module resolves (guards against a broken refactor)", () => {
     expect(typeof SendExecutor).toBe("function");
+  });
+});
+
+describe("Phase 6 — exact MIME artifact safety invariants (static)", () => {
+  const srcDir = fileURLToPath(new URL("../../src", import.meta.url));
+
+  function walkSrc(dir: string): string[] {
+    const out: string[] = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = `${dir}/${entry.name}`;
+      if (entry.isDirectory()) out.push(...walkSrc(full));
+      else if (entry.name.endsWith(".ts")) out.push(full);
+    }
+    return out;
+  }
+
+  it("the worker NEVER issues a direct INSERT into transport.send_mime_artifacts", () => {
+    const files = walkSrc(srcDir);
+    const rx = /insert\s+into\s+transport\.send_mime_artifacts/i;
+    const offenders = files.filter((f) => rx.test(readFileSync(f, "utf8")));
+    expect(offenders).toEqual([]);
+  });
+
+  it("artifact creation goes ONLY through create_or_verify_send_mime_artifact", () => {
+    const repos = readSrc("../../src/db/repositories.ts");
+    // The repository's sole write path is the SECURITY DEFINER function.
+    expect(repos).toMatch(/transport\.create_or_verify_send_mime_artifact/);
+    // And it never INSERTs the table directly.
+    expect(repos).not.toMatch(
+      /insert\s+into\s+transport\.send_mime_artifacts/i,
+    );
+  });
+
+  it("reconcileSentCopy uses stored bytes and NEVER rebuilds MIME on restart", () => {
+    const ts = readSrc("../../src/workers/send-executor.ts");
+    const fn =
+      /private async reconcileSentCopy\([\s\S]*?\n {2}\}\n\n {2}\/\//.exec(ts);
+    expect(fn).not.toBeNull();
+    const body = fn![0];
+    // No MIME rebuild after acceptance — it loads the exact stored artifact.
+    expect(body).not.toMatch(/buildOutboundMime/);
+    expect(body).toMatch(/getBySendAttempt/);
+    // And it never constructs a submission (reconciliation is IMAP-only).
+    expect(body).not.toMatch(/createSubmission/);
+  });
+
+  it("the artifact is persisted BEFORE the smtp_in_progress transition site", () => {
+    const ts = readSrc("../../src/workers/send-executor.ts");
+    const create = ts.indexOf("this.deps.mimeArtifacts.createOrVerify(");
+    const submit = ts.indexOf("submission.sendMessage(");
+    expect(create).toBeGreaterThan(-1);
+    expect(submit).toBeGreaterThan(-1);
+    // Persistence precedes the single SMTP submission site.
+    expect(create).toBeLessThan(submit);
   });
 });

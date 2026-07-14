@@ -3,6 +3,7 @@ import type {
   MailboxFolderRow,
   MailboxRow,
   MailMessageMeta,
+  MimeArtifactRow,
   MirrorSnapshotRow,
   SendAttemptRow,
   SendIntentRow,
@@ -11,7 +12,11 @@ import type {
   SyncRequestRow,
 } from "../../src/domain/models.js";
 import { canTransition, type SendState } from "../../src/domain/send-state.js";
-import { SnapshotUnavailableError } from "../../src/domain/errors.js";
+import {
+  MimeArtifactError,
+  SnapshotUnavailableError,
+} from "../../src/domain/errors.js";
+import { sha256Hex } from "../../src/mime/outbound-builder.js";
 import type {
   AuditWriter,
   CredentialReader,
@@ -20,6 +25,7 @@ import type {
   HeartbeatWriter,
   MailboxReader,
   MessageStore,
+  MimeArtifactStore,
   MirrorSnapshotReader,
   SendAttemptStore,
   SendIntentReader,
@@ -27,6 +33,20 @@ import type {
   SyncRequestStore,
   WorkerClaimStore,
 } from "../../src/db/repository-interfaces.js";
+
+/**
+ * A pg-like error carrying a SQLSTATE `code`, so a fake can faithfully reproduce
+ * a DB constraint/trigger rejection (e.g. the 23514 raised by
+ * trg_send_attempts_require_mime_before_smtp) without an `as any` cast.
+ */
+export class FakePgError extends Error {
+  public readonly code: string;
+  public constructor(code: string, message: string) {
+    super(message);
+    this.code = code;
+    this.name = "FakePgError";
+  }
+}
 
 /**
  * In-memory repository fakes that faithfully reproduce the safety-relevant
@@ -282,6 +302,14 @@ export class FakeSendIntentRepo implements SendIntentReader {
 
 export class FakeSendAttemptRepo implements SendAttemptStore {
   public readonly rows = new Map<string, SendAttemptRow>();
+  /**
+   * Mirrors the DB ordering guard trg_send_attempts_require_mime_before_smtp:
+   * when set, the claimed -> smtp_in_progress transition is REJECTED with a
+   * 23514 (as the real trigger does) unless the predicate confirms a valid
+   * retained MIME artifact exists for the attempt. Left null in tests that do
+   * not exercise the artifact ordering.
+   */
+  public mimeArtifactGuard: ((sendAttemptId: string) => boolean) | null = null;
 
   public getById(id: string): Promise<SendAttemptRow | null> {
     return Promise.resolve(this.rows.get(id) ?? null);
@@ -323,6 +351,23 @@ export class FakeSendAttemptRepo implements SendAttemptStore {
         ),
       );
     }
+    // Artifact-before-SMTP ordering guard (mirrors
+    // trg_send_attempts_require_mime_before_smtp): a missing/invalid artifact
+    // makes the claimed -> smtp_in_progress UPDATE fail 23514, so the executor
+    // treats it as failed_before_delivery with ZERO SMTP.
+    if (
+      input.expectedState === "claimed" &&
+      input.toState === "smtp_in_progress" &&
+      this.mimeArtifactGuard !== null &&
+      !this.mimeArtifactGuard(input.id)
+    ) {
+      return Promise.reject(
+        new FakePgError(
+          "23514",
+          "send attempt cannot enter smtp_in_progress without a persisted MIME artifact",
+        ),
+      );
+    }
     const f = input.fields ?? {};
     const updated: SendAttemptRow = {
       ...row,
@@ -339,6 +384,116 @@ export class FakeSendAttemptRepo implements SendAttemptStore {
     };
     this.rows.set(input.id, updated);
     return Promise.resolve(updated);
+  }
+}
+
+/**
+ * In-memory transport.send_mime_artifacts + create_or_verify function. Faithful
+ * to the safety-relevant DB behaviour:
+ *  - FIRST-CREATE only while the attempt is EXACTLY 'claimed' (via `attemptState`,
+ *    mirroring the function's state gate + the BEFORE INSERT trigger), with the
+ *    exact-bytes hash/size/25MiB-bound re-checked.
+ *  - A second call with an artifact already present is the VERIFY path: it
+ *    succeeds only on EXACT identity, ALWAYS re-hashing the caller's bytes
+ *    against the stored durable digest/size, and NEVER overwrites bytes.
+ *  - Any rejection is the uniform content-free MimeArtifactError (the repo's
+ *    mapping of the function's 23514).
+ * The worker never INSERTs directly — this fake IS the function, exactly as the
+ * repository only ever calls it. One artifact per attempt (keyed by attempt id).
+ */
+export class FakeMimeArtifactRepo implements MimeArtifactStore {
+  public readonly rows = new Map<string, MimeArtifactRow>();
+  public createOrVerifyCalls = 0;
+  private seq = 1;
+  /** Reads the attempt's current state (mirrors the function's FOR UPDATE read). */
+  public attemptState: ((sendAttemptId: string) => SendState | null) | null =
+    null;
+
+  /** Test-only direct seed (stands in for a previously-created artifact). */
+  public seed(input: {
+    sendAttemptId: string;
+    sendIntentId: string;
+    workspaceId: string;
+    messageId: string;
+    rawMime: Buffer;
+    clearedAt?: Date | null;
+  }): MimeArtifactRow {
+    const cleared = input.clearedAt ?? null;
+    const row: MimeArtifactRow = {
+      id: `mime-${this.seq++}`,
+      sendAttemptId: input.sendAttemptId,
+      sendIntentId: input.sendIntentId,
+      workspaceId: input.workspaceId,
+      messageId: input.messageId,
+      mimeSha256: sha256Hex(input.rawMime),
+      sizeBytes: BigInt(input.rawMime.length),
+      rawMime: cleared !== null ? null : Buffer.from(input.rawMime),
+      clearedAt: cleared,
+    };
+    this.rows.set(input.sendAttemptId, row);
+    return row;
+  }
+
+  public createOrVerify(input: {
+    sendAttemptId: string;
+    sendIntentId: string;
+    workspaceId: string;
+    messageId: string;
+    mimeSha256: string;
+    sizeBytes: bigint;
+    rawMime: Buffer;
+  }): Promise<MimeArtifactRow> {
+    this.createOrVerifyCalls += 1;
+    const existing = this.rows.get(input.sendAttemptId);
+    if (existing !== undefined) {
+      // VERIFY path — permitted regardless of the attempt's current state, but
+      // the caller must PROVE it still holds the exact bytes: re-hash + re-size
+      // the caller's ACTUAL bytes against the stored durable digest/size, match
+      // every ref field, and (while retained) byte-compare.
+      const digest = sha256Hex(input.rawMime);
+      const diverges =
+        existing.sendIntentId !== input.sendIntentId ||
+        existing.workspaceId !== input.workspaceId ||
+        existing.messageId !== input.messageId ||
+        existing.mimeSha256 !== input.mimeSha256 ||
+        existing.sizeBytes !== input.sizeBytes ||
+        digest !== existing.mimeSha256 ||
+        BigInt(input.rawMime.length) !== existing.sizeBytes ||
+        (existing.rawMime !== null && !existing.rawMime.equals(input.rawMime));
+      if (diverges) return Promise.reject(new MimeArtifactError());
+      return Promise.resolve(existing);
+    }
+    // FIRST-CREATE path — the attempt must be EXACTLY 'claimed'.
+    const state = this.attemptState?.(input.sendAttemptId) ?? null;
+    if (state !== "claimed") return Promise.reject(new MimeArtifactError());
+    const digest = sha256Hex(input.rawMime);
+    if (
+      digest !== input.mimeSha256 ||
+      BigInt(input.rawMime.length) !== input.sizeBytes ||
+      input.sizeBytes > 26_214_400n ||
+      input.sizeBytes <= 0n
+    ) {
+      return Promise.reject(new MimeArtifactError());
+    }
+    const row: MimeArtifactRow = {
+      id: `mime-${this.seq++}`,
+      sendAttemptId: input.sendAttemptId,
+      sendIntentId: input.sendIntentId,
+      workspaceId: input.workspaceId,
+      messageId: input.messageId,
+      mimeSha256: input.mimeSha256,
+      sizeBytes: input.sizeBytes,
+      rawMime: Buffer.from(input.rawMime),
+      clearedAt: null,
+    };
+    this.rows.set(input.sendAttemptId, row);
+    return Promise.resolve(row);
+  }
+
+  public getBySendAttempt(
+    sendAttemptId: string,
+  ): Promise<MimeArtifactRow | null> {
+    return Promise.resolve(this.rows.get(sendAttemptId) ?? null);
   }
 }
 
