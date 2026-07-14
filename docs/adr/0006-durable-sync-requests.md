@@ -1,6 +1,6 @@
 # ADR 0006 — Durable, claimable sync requests
 
-## Status: accepted (Phase 3A hardening)
+## Status: accepted (Phase 3A hardening); extended by "Generation + token fencing" (Phase 4)
 
 ## Context
 
@@ -28,7 +28,9 @@ A single `SyncRequestDispatcher` is the only consumer. Each dispatch pass:
 3. For each claimed row: if the mailbox is not syncable (missing / disabled /
    kill switch), mark the request `failed` (content-free code) and enqueue
    nothing (no IMAP connect). Otherwise enqueue a `sync_mailbox` pg-boss job with
-   a **deterministic** `singletonKey = sync-req:{id}`.
+   a **deterministic, generation-scoped** `singletonKey = sync-req:{id}:gen:{g}`
+   (see "Generation + token fencing" below) whose payload carries the claim's
+   `claimGeneration` (= `attempt_count`) and `claimToken` (= `claimed_at`).
 
 ### State flow
 
@@ -58,8 +60,40 @@ never stolen.
 
 - **Crash after claim, before enqueue:** the lease expires → the row is
   reclaimed (`attempt_count += 1`) and re-enqueued. Recovery is automatic.
-- **Crash after enqueue, before ack:** the deterministic `sync-req:{id}` key
-  means a re-dispatch cannot create a duplicate job — pg-boss dedups it.
+- **Crash after enqueue, before ack:** within the SAME generation the
+  deterministic `sync-req:{id}:gen:{g}` key means a re-dispatch cannot create a
+  duplicate job — pg-boss dedups it. A reclaim (crash / lease expiry) bumps the
+  generation and therefore mints a NEW key, so the reclaimed job is deliberately
+  not blocked by a dead generation's still-queued job; the fenced CAS below is
+  what guarantees at most one effective claimant across generations.
+
+### Generation + token fencing (Phase 4)
+
+The lease is fenced by a **two-part tuple** carried end-to-end on the job
+payload, using columns that already exist (no schema change):
+
+- `claimGeneration` = `attempt_count` at claim time — advances by exactly 1 on
+  each durable (re)claim; never on a renewal, continuation, or pg-boss retry.
+- `claimToken` = `claimed_at` at claim time — moves on every claim and on every
+  successful renewal.
+
+A claimant "owns" the request only when a single atomic CAS matches
+`status='claimed' AND attempt_count = <held generation> AND claimed_at = <held
+token>`. This fences **every** ownership boundary:
+
+- an **ownership assert renewal before every executor batch** (including the
+  first) — a superseded claimant loses the CAS and stops **without opening
+  IMAP**;
+- the **continuation** enqueue (same generation, current token; the
+  continuation key `sync-req:{id}:gen:{g}:uid:{cursor}` is generation-scoped);
+- the **terminal transitions** `markCompleted` and `markFailed`, both fenced on
+  the same tuple — a superseded generation can never complete or fail a request
+  a newer generation already took over (a lost CAS is a silent no-op).
+
+The always-unfenced terminal bound is `reapExhausted` (the hard `maxAttempts`
+cap). A real two-worker reclaim race is exercised against throwaway Postgres in
+`test/integration/sync-requests.test.ts`; the invariants are statically guarded
+by `contract:verify` checks 15b–15e and the `static-regression-scan` suite.
 
 ### Max attempts vs `sync_mailbox.retryLimit = 5` (no multiplication)
 
