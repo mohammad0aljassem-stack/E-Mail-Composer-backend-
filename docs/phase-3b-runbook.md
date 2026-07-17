@@ -49,14 +49,14 @@ Authorization must name, exactly:
   applied.
 - Role creation (`transport_worker`) and the **exact grants** (including the
   `phase3_send_attempt_transition_ok` EXECUTE grant — see
-  [runbook.md](runbook.md)). Note the **known follow-up grant**: the canonical
-  migrations grant the worker **no** `SELECT` on `public.draft_versions`, and
-  the send/mirror payload resolvers therefore fail **closed**
-  (`draft_version_unreadable` / `skipped_missing_payload`). Before Gate G (and
-  before `MAIL_DRAFT_MIRROR_ENABLED` can be effective) an **additive UI-owned
-  grant migration** — `GRANT SELECT ON public.draft_versions TO
-transport_worker` — must land through the canonical manifest workflow
-  (never an ad-hoc statement, never from this repo).
+  [runbook.md](runbook.md)). The worker reads confirmed content **only** through
+  the private v2 accessors — the canonical chain grants `transport_worker`
+  `EXECUTE` on `transport.get_send_snapshot(uuid)` and
+  `transport.get_mirror_snapshot(uuid,uuid,bigint)` (migration
+  `20260716100000`) and **no** table grant on `public.draft_versions`. The
+  send/mirror payload resolvers fail **closed** (`snapshot_unavailable` /
+  `skipped_missing_payload`) for a missing/legacy/inconsistent intent. No extra
+  grant is a prerequisite — the private functions ARE the grant.
 - The **expected schema diff** (reviewed) and the **rollback method** for this
   database change.
 
@@ -146,15 +146,15 @@ Gate G **additionally requires**, on top of the Gate F matrix:
 - `MAIL_SEND_ENABLED=true` (worker restart required — env flags are read at
   startup). This is the only flag that registers the `send_message` handler,
   the sole code path able to construct an SMTP client.
-- The **pre-Gate-G grant prerequisite**: an additive **UI-owned** grant
-  migration — `GRANT SELECT ON public.draft_versions TO transport_worker` —
-  applied through the canonical manifest workflow (listed under Gate C's
-  exact grants). Without it the production send-payload resolver **fails
-  closed** with `draft_version_unreadable` under the real worker role: no
-  payload, no hash verification, no SMTP byte. The same grant is required
-  before `MAIL_DRAFT_MIRROR_ENABLED` can be effective (the mirror resolver
-  reads the same immutable `draft_versions` snapshots and skips closed
-  without it).
+- The **private snapshot accessors** (contract v2): the worker resolves
+  confirmed content by `send_intent_id` through
+  `transport.get_send_snapshot(uuid)` (and mirroring through
+  `transport.get_mirror_snapshot(uuid,uuid,bigint)`), on which it holds the
+  canonical `EXECUTE` grant — never a direct `public.draft_versions` `SELECT`
+  (denied 42501). A missing/legacy (proof-v1)/inconsistent intent yields a
+  uniform `P0002`, which the production send-payload resolver maps to a
+  content-free **fail-closed** `snapshot_unavailable`: no payload, no hash
+  verification, no SMTP byte. The mirror resolver skips closed the same way.
 
 ### Gate H — failure drill
 

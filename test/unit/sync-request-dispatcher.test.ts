@@ -56,7 +56,13 @@ function makeHarness(overrides?: {
     mailboxes,
     sendClaims,
     enqueueSync: (job) => {
-      enqueued.push({ job, key: singletonKeys.syncRequest(job.syncRequestId) });
+      enqueued.push({
+        job,
+        key: singletonKeys.syncRequest(
+          job.syncRequestId,
+          job.claimGeneration ?? 0,
+        ),
+      });
       return Promise.resolve(`job-${enqueued.length}`);
     },
     clock,
@@ -109,16 +115,28 @@ describe("SyncRequestDispatcher — claim + dispatch", () => {
     expect(h.enqueued).toHaveLength(1);
   });
 
-  // Dedup: re-dispatch of the same durable request uses a DETERMINISTIC key.
-  it("derives a deterministic pg-boss key from the durable request id", async () => {
+  // Fencing: the dispatch job carries the claim's generation+token, and the
+  // singleton key is GENERATION-SCOPED. A stale reclaim bumps the generation and
+  // therefore mints a NEW key (not deduped against the dead generation) — the
+  // fenced CAS, not the key, keeps at most one claimant effective.
+  it("carries the fencing tuple and a generation-scoped key; a reclaim bumps the generation", async () => {
     const row = h.syncRequests.seed({ workspaceId: WS, mailboxId: MB });
     await h.dispatcher.dispatchOnce();
-    // Force a stale reclaim so it dispatches a second time.
+    // First claim: generation 1, token = the just-claimed claimed_at.
+    const claimed = await h.syncRequests.getById(row.id);
+    expect(h.enqueued[0]?.job.claimGeneration).toBe(1);
+    expect(h.enqueued[0]?.job.claimToken).toBe(
+      claimed?.claimedAt?.toISOString(),
+    );
+    expect(h.enqueued[0]?.key).toBe(`sync-req:${row.id}:gen:1`);
+    // Force a stale reclaim so it dispatches a second time (generation 2).
     h.clock.advance(400_000);
     await h.dispatcher.dispatchOnce();
     expect(h.enqueued).toHaveLength(2);
-    expect(h.enqueued[0]?.key).toBe(h.enqueued[1]?.key);
-    expect(h.enqueued[0]?.key).toBe(`sync-req:${row.id}`);
+    expect(h.enqueued[1]?.job.claimGeneration).toBe(2);
+    expect(h.enqueued[1]?.key).toBe(`sync-req:${row.id}:gen:2`);
+    // The two generations map to DISTINCT keys.
+    expect(h.enqueued[0]?.key).not.toBe(h.enqueued[1]?.key);
   });
 
   // Whole-mailbox (folder null) vs folder-scoped are distinct rows/jobs/modes.
@@ -269,29 +287,6 @@ describe("SyncRequestDispatcher — stale send-claim expiry (C7)", () => {
     });
     await h.dispatcher.dispatchOnce();
     expect(h.sendClaims.claims.has("attempt-stale")).toBe(true);
-  });
-});
-
-describe("SyncRequestDispatcher — terminal state + content-free errors", () => {
-  it("marks a request completed after the sync completes", async () => {
-    const h = makeHarness();
-    const row = h.syncRequests.seed({ workspaceId: WS, mailboxId: MB });
-    await h.dispatcher.dispatchOnce(); // -> claimed
-    await h.dispatcher.markCompleted(row.id);
-    const after = await h.syncRequests.getById(row.id);
-    expect(after?.status).toBe("completed");
-    expect(after?.completedAt).not.toBeNull();
-  });
-
-  it("stores only a bounded, content-free last_error", async () => {
-    const h = makeHarness();
-    const row = h.syncRequests.seed({ workspaceId: WS, mailboxId: MB });
-    await h.dispatcher.dispatchOnce();
-    // Even if a caller passes a long/sensitive string, it is bounded + code-only.
-    await h.dispatcher.markFailed(row.id, "x".repeat(5000));
-    const after = await h.syncRequests.getById(row.id);
-    expect(after?.status).toBe("failed");
-    expect((after?.lastError ?? "").length).toBeLessThanOrEqual(200);
   });
 });
 

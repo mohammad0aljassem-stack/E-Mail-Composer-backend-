@@ -80,6 +80,21 @@ export interface SyncMailboxJob {
    * completed/failed. Absent for ad-hoc (IDLE-wakeup) syncs.
    */
   readonly syncRequestId?: string;
+  /**
+   * Durable fencing tuple (part 1): `attempt_count` at claim time. Advances by
+   * exactly 1 on each durable (re)claim via claimBatch; never on renew,
+   * continuation, or pg-boss retry. Present together with `claimToken` for
+   * durable-request jobs; both are ABSENT for ad-hoc (IDLE-wakeup) jobs.
+   */
+  readonly claimGeneration?: number;
+  /**
+   * Durable fencing tuple (part 2): `claimed_at` at claim time, serialized as an
+   * ISO-8601 string with millisecond precision (JSON-safe). It round-trips to
+   * the EXACT claimed_at Date because we control claimed_at = the `now` Date we
+   * pass into claimBatch. Present together with `claimGeneration` for
+   * durable-request jobs; both are ABSENT for ad-hoc jobs.
+   */
+  readonly claimToken?: string;
 }
 
 export interface DraftMirrorJob {
@@ -111,24 +126,36 @@ export const singletonKeys = {
   syncMailbox: (mailboxId: string, folder: string): string =>
     `sync:${mailboxId}:${folder}`,
   /**
-   * Durable-request dispatch key: DETERMINISTIC in the sync_request id so a
-   * re-claim (crash / lease expiry) never enqueues a duplicate job for the same
-   * request, and whole-mailbox vs folder-scoped requests (distinct rows/ids per
-   * the canonical uq_sync_requests_open dedup) map to distinct keys.
+   * Durable-request dispatch key: GENERATION-SCOPED in the sync_request id and
+   * the claim generation (`attempt_count` at claim time). Within ONE generation,
+   * a re-dispatch or crash-recovery duplicate produces the SAME key and dedups
+   * to null. A durable RE-CLAIM bumps the generation and therefore mints a NEW
+   * key, so it is intentionally NOT deduped against a stale queued job left over
+   * from a dead generation — the fenced CAS (generation + token) is what
+   * guarantees at-most-one EFFECTIVE claimant across generations, not the key.
+   * Whole-mailbox vs folder-scoped requests are distinct rows/ids (per the
+   * canonical uq_sync_requests_open dedup) and so map to distinct keys anyway.
    */
-  syncRequest: (syncRequestId: string): string => `sync-req:${syncRequestId}`,
+  syncRequest: (syncRequestId: string, claimGeneration: number): string =>
+    `sync-req:${syncRequestId}:gen:${claimGeneration}`,
   /**
-   * Multi-batch continuation key for a durable request: DETERMINISTIC in the
-   * request id AND the folder-cursor position (lastSeenUid) after the last
-   * completed batch. Distinct from the original `sync-req:{id}` key by
-   * construction, so a continuation can never be swallowed by the singleton
-   * dedup of the currently running/queued dispatch job; and a crash-recovery
-   * duplicate of the SAME continuation (same request, same cursor) produces the
-   * SAME key, so pg-boss dedups it (boss.send returns null → proven-equivalent
-   * work already queued).
+   * Multi-batch continuation key for a durable request: GENERATION-SCOPED in the
+   * request id and claim generation, AND the folder-cursor position (lastSeenUid)
+   * after the last completed batch. A continuation stays within the SAME
+   * generation as the job that enqueued it. Distinct from the generation's
+   * `sync-req:{id}:gen:{g}` dispatch key by the `:uid:` suffix, so a continuation
+   * can never be swallowed by the dispatch job's singleton dedup; and a
+   * crash-recovery duplicate of the SAME continuation (same request, generation,
+   * cursor) produces the SAME key, so pg-boss dedups it (boss.send returns null →
+   * proven-equivalent work already queued). A reclaim into a new generation mints
+   * a fresh keyspace; the fenced CAS keeps only one claimant effective.
    */
-  syncRequestContinuation: (syncRequestId: string, cursorUid: string): string =>
-    `sync-req:${syncRequestId}:uid:${cursorUid}`,
+  syncRequestContinuation: (
+    syncRequestId: string,
+    claimGeneration: number,
+    cursorUid: string,
+  ): string =>
+    `sync-req:${syncRequestId}:gen:${claimGeneration}:uid:${cursorUid}`,
   draftMirror: (draftId: string, revision: string): string =>
     `draft:${draftId}:${revision}`,
   sendMessage: (sendIntentId: string): string => `send:${sendIntentId}`,

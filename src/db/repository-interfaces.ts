@@ -1,12 +1,14 @@
 import type {
   DraftMirrorRow,
-  DraftVersionRow,
   FolderRole,
   MailboxFolderRow,
   MailboxRow,
   MailMessageMeta,
+  MimeArtifactRow,
+  MirrorSnapshotRow,
   SendAttemptRow,
   SendIntentRow,
+  SendSnapshotRow,
   StoredCredential,
   SyncRequestRow,
 } from "../domain/models.js";
@@ -88,18 +90,30 @@ export interface DraftMirrorStore {
 }
 
 /**
- * SELECT-only lookup of the immutable draft snapshot for an EXACT confirmed
- * revision (public.draft_versions). Returns the highest version_no when
- * several snapshots share the same source_revision, and null when no snapshot
- * exists for that exact revision — the caller must fail CLOSED (checkpoints
- * are not guaranteed for every revision; a near-miss is never substituted).
+ * The worker's ONLY read path for confirmed SEND content: the private
+ * transport.get_send_snapshot(send_intent_id) accessor. It returns the exact
+ * draft_versions snapshot bound to the intent, or raises P0002 (mapped here to
+ * a content-free SnapshotUnavailableError) for a missing/legacy/inconsistent
+ * intent. It NEVER returns null and NEVER reads the mutable draft, a near-miss
+ * revision, or a caller-supplied snapshot id — the intent id is the sole key.
  */
-export interface DraftVersionReader {
-  findDraftVersion(
+export interface SendSnapshotReader {
+  getSendSnapshot(sendIntentId: string): Promise<SendSnapshotRow>;
+}
+
+/**
+ * The worker's read path for MIRRORING a known revision: the private
+ * transport.get_mirror_snapshot(workspace_id, draft_id, source_revision)
+ * accessor. Returns the newest snapshot for that EXACT triple, or raises P0002
+ * (mapped to SnapshotUnavailableError) when none exists (including any workspace
+ * mismatch — the workspace is part of the exact-match key). Never used to send.
+ */
+export interface MirrorSnapshotReader {
+  getMirrorSnapshot(
     workspaceId: string,
     draftId: string,
     sourceRevision: bigint,
-  ): Promise<DraftVersionRow | null>;
+  ): Promise<MirrorSnapshotRow>;
 }
 
 export interface SendIntentReader {
@@ -122,6 +136,32 @@ export interface SendAttemptStore {
       evidence?: Record<string, string | number | boolean>;
     };
   }): Promise<SendAttemptRow | null>;
+}
+
+/**
+ * The worker's exact-MIME-artifact store (transport.send_mime_artifacts). The
+ * worker has EXECUTE on transport.create_or_verify_send_mime_artifact (a SECURITY
+ * DEFINER function that INSERTs as its definer) plus SELECT/UPDATE on the table —
+ * it holds NO direct INSERT and NEVER runs `insert into
+ * transport.send_mime_artifacts`. `createOrVerify` is the sole write path: it
+ * first-creates the artifact while the attempt is 'claimed' (before any SMTP
+ * byte) and, on a second identical call, VERIFIES the stored row for
+ * restart/reconciliation, always re-hashing the caller's bytes. A uniform 23514
+ * from the function maps to a content-free MimeArtifactError. `getBySendAttempt`
+ * loads the EXACT stored bytes on restart so the Sent-copy append reuses them —
+ * the worker never rebuilds MIME after acceptance.
+ */
+export interface MimeArtifactStore {
+  createOrVerify(input: {
+    sendAttemptId: string;
+    sendIntentId: string;
+    workspaceId: string;
+    messageId: string;
+    mimeSha256: string;
+    sizeBytes: bigint;
+    rawMime: Buffer;
+  }): Promise<MimeArtifactRow>;
+  getBySendAttempt(sendAttemptId: string): Promise<MimeArtifactRow | null>;
 }
 
 export interface WorkerClaimStore {
@@ -158,6 +198,18 @@ export interface HeartbeatWriter {
  * method is a single atomic statement; `claimBatch` is a concurrency-safe
  * `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED)` so at most one
  * worker claims any one request.
+ *
+ * FENCING TUPLE (generation + token; NO schema change): a claimant "owns" a
+ * request iff, in a single atomic CAS, the row is still `status = 'claimed'`
+ * AND `attempt_count = expectedGeneration` AND `claimed_at = expectedToken`.
+ *   - `claimGeneration` = `attempt_count` at claim time. It advances by exactly
+ *     1 on each durable (re)claim via `claimBatch` — never on renew, on a
+ *     continuation job, or on a pg-boss retry.
+ *   - `claimToken` = `claimed_at` at claim time. It moves on every claim AND on
+ *     every successful `renewLease`.
+ * A stale/superseded claimant (a dead generation, or a token another renewal
+ * moved) fails every CAS — renewLease/markCompleted/markFailed all return null —
+ * and MUST stop, marking nothing, opening no IMAP connection.
  */
 export interface SyncRequestStore {
   /**
@@ -165,7 +217,9 @@ export interface SyncRequestStore {
    * `claimed` whose `claimedAt < leaseCutoff` (a STALE claim past the lease —
    * reclaimable crash recovery) AND `attemptCount < maxAttempts`. Each claimed
    * row moves to `claimed`, sets `claimedAt = now`, and increments
-   * `attemptCount`. A FRESH claim (recent `claimedAt`) is never stolen.
+   * `attemptCount`. The incremented `attemptCount` is the claim's GENERATION and
+   * `claimedAt = now` is its TOKEN. A FRESH claim (recent `claimedAt`) is never
+   * stolen.
    */
   claimBatch(input: {
     limit: number;
@@ -178,24 +232,46 @@ export interface SyncRequestStore {
    * Fenced lease renewal for an in-flight claim (single-claimant guarantee,
    * no schema change): a single CAS statement
    * `UPDATE ... SET claimed_at = now WHERE id AND status = 'claimed' AND
-   * claimed_at = prevClaimedAt RETURNING claimed_at`. Returns the NEW
-   * `claimedAt` (the next fencing token) or null when the lease was lost —
-   * another claimant re-claimed the row (its claimed_at moved) or the request
-   * reached a terminal state. `prevClaimedAt` MUST be the exact Date previously
-   * returned by claimBatch/getById/renewLease (Postgres timestamptz keeps the
+   * attempt_count = expectedGeneration AND claimed_at = prevClaimedAt
+   * RETURNING claimed_at`. Generation is UNCHANGED by a renewal (renewals are
+   * not re-claims). Returns the NEW `claimedAt` (the next fencing token) or null
+   * when the lease was lost — another claimant re-claimed the row (generation
+   * and/or token moved) or the request reached a terminal state. `prevClaimedAt`
+   * MUST be the exact Date previously returned by claimBatch/renewLease or
+   * parsed from the job payload's `claimToken` (Postgres timestamptz keeps the
    * millisecond value exactly; never a re-derived timestamp).
    */
-  renewLease(id: string, prevClaimedAt: Date, now: Date): Promise<Date | null>;
-
-  /** Terminal success: `claimed -> completed`, set `completedAt`. Idempotent. */
-  markCompleted(id: string, now: Date): Promise<SyncRequestRow | null>;
+  renewLease(
+    id: string,
+    expectedGeneration: number,
+    prevClaimedAt: Date,
+    now: Date,
+  ): Promise<Date | null>;
 
   /**
-   * Terminal failure: `claimed|pending -> failed`, set `completedAt` and a
-   * bounded, content-free `lastError` code. Idempotent.
+   * Fenced terminal success: `claimed -> completed`, set `completedAt`, ONLY
+   * when `attempt_count = expectedGeneration` AND `claimed_at = expectedToken`.
+   * A lost CAS (another generation took over) returns null — a silent no-op.
+   * Idempotent within the owning generation.
+   */
+  markCompleted(
+    id: string,
+    expectedGeneration: number,
+    expectedToken: Date,
+    now: Date,
+  ): Promise<SyncRequestRow | null>;
+
+  /**
+   * Fenced terminal failure: `claimed -> failed`, set `completedAt` and a
+   * bounded, content-free `lastError` code, ONLY when `attempt_count =
+   * expectedGeneration` AND `claimed_at = expectedToken`. Every legitimate
+   * terminal-fail caller holds a live claim, so there is no `pending` allowance;
+   * the unfenced terminal bound is `reapExhausted`. A lost CAS returns null.
    */
   markFailed(input: {
     id: string;
+    expectedGeneration: number;
+    expectedToken: Date;
     now: Date;
     lastError: string;
   }): Promise<SyncRequestRow | null>;
@@ -203,7 +279,7 @@ export interface SyncRequestStore {
   /**
    * Sweep STALE `claimed` rows whose `attemptCount >= maxAttempts` to `failed`
    * with a bounded content-free code. Returns the number reaped. This is the
-   * terminal bound on durable re-claims.
+   * terminal bound on durable re-claims (the only UNFENCED terminal write).
    */
   reapExhausted(input: {
     now: Date;

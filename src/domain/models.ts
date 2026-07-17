@@ -72,21 +72,37 @@ export interface DraftMirrorRow {
 }
 
 /**
- * Immutable, append-only draft snapshot (public.draft_versions). The worker
- * reads it ONLY to reconstruct the exact confirmed revision of a send intent /
- * mirror job (source_revision === the immutable revision); it never reads the
- * mutable drafts row as authority. body_json is the canonical TipTap-style doc
- * (jsonb, ≤ 1 MiB) rendered by the worker's deterministic draft-renderer.
+ * The EXACT confirmed-content snapshot bound to one immutable send intent,
+ * returned by the PRIVATE worker-only function transport.get_send_snapshot(
+ * send_intent_id). The worker NEVER reads public.draft_versions (no table grant)
+ * nor the mutable drafts row: this function is the single read path and it fails
+ * closed (P0002) for a missing/legacy/inconsistent intent, so a returned row is
+ * always the exact workspace/draft/revision the user confirmed. body_json is the
+ * canonical TipTap-style doc (jsonb, ≤ 1 MiB) rendered by the deterministic
+ * draft-renderer; the executor's verifyIntegrity re-checks the rendered hashes.
  */
-export interface DraftVersionRow {
-  id: string;
+export interface SendSnapshotRow {
+  draftVersionId: string;
   workspaceId: string;
   draftId: string;
-  versionNo: bigint;
   sourceRevision: bigint;
+  versionNo: bigint;
   subject: string;
   bodyJson: unknown;
-  createdAt: Date;
+}
+
+/**
+ * Newest snapshot of one EXACT (workspace, draft, source_revision) triple,
+ * returned by the PRIVATE worker-only function transport.get_mirror_snapshot(
+ * workspace_id, draft_id, source_revision) — the draft-mirror read path (never
+ * used for sending). Fails closed (P0002) when no such snapshot exists. Carries
+ * no created_at: mirror MIME headers are pinned deterministically without it.
+ */
+export interface MirrorSnapshotRow {
+  draftVersionId: string;
+  versionNo: bigint;
+  subject: string;
+  bodyJson: unknown;
 }
 
 export interface AttachmentManifestEntry {
@@ -123,6 +139,19 @@ export interface SendIntentRow {
   confirmedBy: string;
   confirmationProof: string;
   contractVersion: number;
+  /**
+   * Phase 3B (contract v2): the confirmation-proof canonical version. 1 = legacy
+   * (inputs only); 2 = the canonical additionally covers proof_version and the
+   * exact draft_version_id snapshot reference. Drives the worker's proof
+   * re-derivation shape.
+   */
+  proofVersion: number;
+  /**
+   * Phase 3B: the immutable draft_versions snapshot the intent is bound to (v2),
+   * or null for a legacy (proof-v1) intent. Part of the v2 proof canonical. NOT
+   * a resolution key — the worker reads content only via get_send_snapshot.
+   */
+  draftVersionId: string | null;
 }
 
 export interface SendAttemptRow {
@@ -136,6 +165,30 @@ export interface SendAttemptRow {
   smtpResponse: string | null;
   evidence: Readonly<Record<string, string | number | boolean>>;
   version: bigint;
+}
+
+/**
+ * Phase 3B (PRIVATE): the EXACT raw MIME bytes handed to SMTP for one
+ * send_attempt (transport.send_mime_artifacts), bound by sha256 + size and
+ * verified against the attempt/intent/workspace/message_id chain. First-created
+ * ONLY while the attempt is 'claimed' — before any SMTP byte — through the
+ * SECURITY DEFINER function transport.create_or_verify_send_mime_artifact (the
+ * worker holds NO direct INSERT). `rawMime` is present while retained and NULL
+ * once cleared for retention (after a terminal-for-delivery state); the durable
+ * proof (mimeSha256/sizeBytes/messageId) survives clearing. The worker uses the
+ * stored bytes verbatim for the Sent-folder append on restart/reconciliation —
+ * it never rebuilds MIME after acceptance.
+ */
+export interface MimeArtifactRow {
+  id: string;
+  sendAttemptId: string;
+  sendIntentId: string;
+  workspaceId: string;
+  messageId: string;
+  mimeSha256: string;
+  sizeBytes: bigint;
+  rawMime: Buffer | null;
+  clearedAt: Date | null;
 }
 
 export interface StoredCredential {

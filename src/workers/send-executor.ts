@@ -8,18 +8,18 @@ import type { Clock } from "../domain/clock.js";
 import type {
   AttachmentManifestEntry,
   MailboxRow,
-  SendAttemptRow,
   SendIntentRow,
   SendRecipients,
 } from "../domain/models.js";
 import { isPostAcceptance, isTerminal } from "../domain/send-state.js";
-import { buildOutboundMime } from "../mime/outbound-builder.js";
+import { buildOutboundMime, sha256Hex } from "../mime/outbound-builder.js";
 import type { BuiltMime } from "../mime/outbound-builder.js";
 import type { Logger } from "../observability/logger.js";
 import type {
   AuditWriter,
   FolderRoleReader,
   MailboxReader,
+  MimeArtifactStore,
   SendAttemptStore,
   SendIntentReader,
   WorkerClaimStore,
@@ -72,6 +72,7 @@ export interface SendExecutorDeps {
   folders: FolderRoleReader;
   claims: WorkerClaimStore;
   audit: AuditWriter;
+  mimeArtifacts: MimeArtifactStore;
   providerFactory: ProviderFactory;
   payloadResolver: SendPayloadResolver;
   clock: Clock;
@@ -88,6 +89,21 @@ export interface SendJob {
   readonly sendIntentId: string;
   readonly sendAttemptId: string;
   readonly workspaceId: string;
+}
+
+/**
+ * True when an error carries the Postgres SQLSTATE 23514 (check/trigger
+ * violation) — used to recognise the DB artifact-before-SMTP ordering guard
+ * (trg_send_attempts_require_mime_before_smtp) rejecting a claimed ->
+ * smtp_in_progress transition without a valid retained artifact. Content-free:
+ * only the SQLSTATE is inspected, never the driver message.
+ */
+function isCheckViolation(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { code?: unknown }).code === "23514"
+  );
 }
 
 function arraysEqual(a: readonly string[], b: readonly string[]): boolean {
@@ -166,14 +182,13 @@ export class SendExecutor {
       return "needs_human_review";
     }
 
-    // (9) Already accepted → Sent-copy reconciliation ONLY.
+    // (9) Already accepted → Sent-copy reconciliation ONLY. Never SMTP again.
     if (isPostAcceptance(attempt.state)) {
       return this.reconcileSentCopy(
         intent,
         attempt.id,
         attempt.version,
         attempt.state as "smtp_accepted" | "sent_copy_pending" | "completed",
-        attempt.evidence,
         log,
       );
     }
@@ -297,10 +312,53 @@ export class SendExecutor {
         return "failed_before_delivery";
       }
 
+      // (C5/Phase 6) PERSIST THE EXACT MIME ARTIFACT BEFORE SMTP. The sha256 +
+      // byte length are computed from the EXACT built Buffer, and the bytes are
+      // persisted through the SECURITY DEFINER create-or-verify function while
+      // the attempt is still 'claimed' (the worker holds NO direct INSERT). Any
+      // rejection is a uniform, content-free 23514 → MimeArtifactError: fail
+      // CLOSED (failed_before_delivery, ZERO SMTP bytes). This is the durable,
+      // byte-bound evidence the DB ordering guard re-verifies at the
+      // claimed -> smtp_in_progress boundary.
+      const mimeSha256 = sha256Hex(built.raw);
+      const sizeBytes = BigInt(built.raw.length);
+      let artifact;
+      try {
+        artifact = await this.deps.mimeArtifacts.createOrVerify({
+          sendAttemptId: cur.id,
+          sendIntentId: intent.id,
+          workspaceId: intent.workspaceId,
+          messageId: intent.messageId,
+          mimeSha256,
+          sizeBytes,
+          rawMime: built.raw,
+        });
+      } catch {
+        await this.toFailedBeforeDelivery(intent, cur.id, cur.version, {
+          reason: "mime_artifact_rejected",
+        });
+        log.warn("send_mime_artifact_rejected");
+        return "failed_before_delivery";
+      }
+      // (j) The persisted artifact MUST bind the exact bytes we built. A
+      // divergence here (defence in depth over the function's own re-hash) fails
+      // CLOSED before a single SMTP byte.
+      if (
+        artifact.mimeSha256 !== mimeSha256 ||
+        artifact.sizeBytes !== sizeBytes ||
+        artifact.messageId !== intent.messageId
+      ) {
+        await this.toFailedBeforeDelivery(intent, cur.id, cur.version, {
+          reason: "mime_artifact_mismatch",
+        });
+        log.warn("send_mime_artifact_mismatch");
+        return "failed_before_delivery";
+      }
+
       // (C1) Capability-scoped construction: the SMTP submission channel is
-      // built ONLY here — strictly AFTER the integrity verification (4) and
-      // the sender-authority guard (4b) above. No other code path may call
-      // createSubmission.
+      // built ONLY here — strictly AFTER the integrity verification (4), the
+      // sender-authority guard (4b) and the exact-MIME persistence above. No
+      // other code path may call createSubmission.
       const submission =
         await this.deps.providerFactory.createSubmission(mailbox);
       try {
@@ -336,18 +394,33 @@ export class SendExecutor {
   ): Promise<SendOutcome> {
     // claimed -> smtp_in_progress (a crash from here = ambiguous on restart).
     // The pinned MIME Date is persisted content-free (an RFC-2822 date names
-    // no body/recipient) BEFORE the network call, so a restart rebuild for
-    // Sent-copy reconciliation reuses the exact same Date header.
-    const inProgress = await this.deps.attempts.compareAndSet({
-      id: attemptId,
-      expectedVersion: versionAtClaimed,
-      expectedState: "claimed",
-      toState: "smtp_in_progress",
-      fields: {
-        messageId: intent.messageId,
-        evidence: { mime_date: mimeDate },
-      },
-    });
+    // no body/recipient) BEFORE the network call. The DB ordering guard
+    // (trg_send_attempts_require_mime_before_smtp) re-verifies a valid retained
+    // MIME artifact exists at exactly this boundary: a missing/invalid artifact
+    // makes this UPDATE raise 23514, which we treat as failed_before_delivery
+    // with ZERO SMTP bytes (the attempt is still 'claimed').
+    let inProgress;
+    try {
+      inProgress = await this.deps.attempts.compareAndSet({
+        id: attemptId,
+        expectedVersion: versionAtClaimed,
+        expectedState: "claimed",
+        toState: "smtp_in_progress",
+        fields: {
+          messageId: intent.messageId,
+          evidence: { mime_date: mimeDate },
+        },
+      });
+    } catch (err) {
+      if (isCheckViolation(err)) {
+        await this.toFailedBeforeDelivery(intent, attemptId, versionAtClaimed, {
+          reason: "mime_artifact_missing_before_smtp",
+        });
+        log.warn("send_mime_artifact_missing_before_smtp");
+        return "failed_before_delivery";
+      }
+      throw err;
+    }
     if (inProgress === null) return "claim_lost";
 
     await this.deps.audit.append({
@@ -535,45 +608,34 @@ export class SendExecutor {
     attemptId: string,
     version: bigint,
     state: "smtp_accepted" | "sent_copy_pending" | "completed",
-    evidence: SendAttemptRow["evidence"],
     log: Logger,
   ): Promise<SendOutcome> {
     if (state === "completed") return "completed";
     const mailbox = await this.requireMailbox(intent.mailboxId);
-    // RESTART rebuild (C5, lazy — only when findByMessageId shows the copy is
-    // actually missing): the payload is re-resolved from the immutable
-    // snapshot and rebuilt with the SAME Message-ID and the SAME pinned Date
-    // persisted in the attempt evidence at build time. PROVEN EQUIVALENCE:
-    // Message-ID, Date, From/To/Subject and the hash-verified bodies are all
-    // identical to the submitted message, so the rebuilt bytes differ from
-    // the wire bytes ONLY in MailComposer's random multipart boundary
-    // strings (pinned by unit test "pinned-date rebuild"). A hash mismatch
-    // on rebuild throws → the catch below parks sent_copy_pending: nothing
-    // divergent is ever appended, and SMTP is never re-entered.
+    // RESTART / RECONCILIATION (Phase 6): the Sent copy is the EXACT stored
+    // artifact bytes — NEVER a rebuild. We load the retained artifact only when
+    // findByMessageId shows the copy is actually missing (lazy), and re-verify
+    // it as defence in depth: bytes present, Message-ID matches the intent,
+    // sizeBytes == octet length, and mimeSha256 == sha256(rawMime). Any
+    // divergence (or a cleared/missing artifact) throws → the catch in
+    // appendSentAndComplete parks sent_copy_pending: nothing is appended, and
+    // SMTP is never re-entered.
     const rawForAppend = async (): Promise<Buffer> => {
-      const payload = await this.deps.payloadResolver.resolve(intent);
-      const outbound: OutboundMessage = {
-        ...payload.message,
-        messageId: intent.messageId,
-      };
-      const pinned = evidence.mime_date;
-      const parsed = typeof pinned === "string" ? new Date(pinned) : null;
-      const date =
-        parsed !== null && !Number.isNaN(parsed.getTime())
-          ? parsed
-          : this.deps.clock.now();
-      const rebuilt = await buildOutboundMime(outbound, { date });
+      const artifact =
+        await this.deps.mimeArtifacts.getBySendAttempt(attemptId);
       if (
-        (intent.htmlHash ?? null) !== (rebuilt.htmlHash ?? null) ||
-        (intent.textHash ?? null) !== (rebuilt.textHash ?? null) ||
-        !manifestEqual(rebuilt.attachmentManifest, intent.attachmentManifest)
+        artifact === null ||
+        artifact.rawMime === null ||
+        artifact.messageId !== intent.messageId ||
+        artifact.sizeBytes !== BigInt(artifact.rawMime.length) ||
+        sha256Hex(artifact.rawMime) !== artifact.mimeSha256
       ) {
         throw new TransportError(
           "send_precondition_failed",
-          "sent-copy rebuild does not match the confirmed intent",
+          "stored MIME artifact unavailable or inconsistent",
         );
       }
-      return rebuilt.raw;
+      return artifact.rawMime;
     };
     // Delegates to appendSentAndComplete, which opens an IMAP session ONLY.
     // Reconciliation after acceptance must NEVER construct a submission.

@@ -35,16 +35,25 @@ describe("queue families + policies", () => {
     expect(singletonKeys.syncMailbox("mb", "INBOX")).toBe("sync:mb:INBOX");
   });
 
-  it("continuation keys are cursor-distinct from the request dispatch key", () => {
-    const dispatch = singletonKeys.syncRequest("r1");
-    const cont = singletonKeys.syncRequestContinuation("r1", "200");
-    expect(dispatch).toBe("sync-req:r1");
-    expect(cont).toBe("sync-req:r1:uid:200");
-    // Never collides with the original dispatch key of the running job...
+  it("dispatch + continuation keys are generation-scoped and cursor-distinct", () => {
+    const dispatch = singletonKeys.syncRequest("r1", 1);
+    const cont = singletonKeys.syncRequestContinuation("r1", 1, "200");
+    expect(dispatch).toBe("sync-req:r1:gen:1");
+    expect(cont).toBe("sync-req:r1:gen:1:uid:200");
+    // Never collides with the generation's dispatch key of the running job...
     expect(cont).not.toBe(dispatch);
-    // ...deterministic per (request, cursor) so a crash-recovery duplicate
-    // dedups, while a NEW cursor position yields a NEW key.
-    expect(singletonKeys.syncRequestContinuation("r1", "200")).toBe(cont);
-    expect(singletonKeys.syncRequestContinuation("r1", "400")).not.toBe(cont);
+    // ...deterministic per (request, generation, cursor) so a crash-recovery
+    // duplicate dedups, while a NEW cursor position yields a NEW key.
+    expect(singletonKeys.syncRequestContinuation("r1", 1, "200")).toBe(cont);
+    expect(singletonKeys.syncRequestContinuation("r1", 1, "400")).not.toBe(
+      cont,
+    );
+    // A durable RE-CLAIM bumps the generation, minting a NEW keyspace that is
+    // intentionally not deduped against the dead generation's queued jobs.
+    expect(singletonKeys.syncRequest("r1", 2)).toBe("sync-req:r1:gen:2");
+    expect(singletonKeys.syncRequest("r1", 2)).not.toBe(dispatch);
+    expect(singletonKeys.syncRequestContinuation("r1", 2, "200")).not.toBe(
+      cont,
+    );
   });
 });

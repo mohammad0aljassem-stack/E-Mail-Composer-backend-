@@ -30,7 +30,7 @@ for the pin:
   "manifestPath": "supabase/contracts/phase3-transport-contract.json",
   "manifestSha256": "…",
   "supportedManifestSchemaVersion": 1,
-  "supportedTransportContractVersion": 1
+  "supportedTransportContractVersion": 2
 }
 ```
 

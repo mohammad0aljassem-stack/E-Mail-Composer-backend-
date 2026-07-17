@@ -22,11 +22,12 @@ import type { ProviderFactory } from "./ports.js";
  *
  * Capability-scoped (C1): createImapSession constructs ONLY the IMAP client and
  * createSubmission constructs ONLY the SMTP client, so read-only sync/mutation/
- * mirror work can never contact an SMTP server. Both methods run the SAME
- * fail-closed configuration gate first (host/port presence + plaintext refusal
- * for BOTH imap_security and smtp_security): a mailbox row with an insecure or
- * incomplete transport config is refused as a whole — deliberately, as a
- * config-integrity check — before any credential is read or decrypted.
+ * mirror work can never contact an SMTP server. Each method runs ONLY its own
+ * protocol's fail-closed configuration gate (host/port presence + plaintext
+ * refusal): createImapSession validates the IMAP endpoint alone (it succeeds
+ * even when the mailbox has no SMTP config — a sync-only mailbox), and
+ * createSubmission validates the SMTP endpoint alone (it never requires IMAP).
+ * The gate runs BEFORE any credential is read or decrypted.
  */
 
 interface DecryptedCredential {
@@ -34,13 +35,17 @@ interface DecryptedCredential {
   pass: string;
 }
 
-/** Mailbox transport endpoints after the fail-closed configuration gate. */
-interface SecureEndpoints {
+/** IMAP endpoint after the fail-closed IMAP configuration gate. */
+interface SecureImapEndpoint {
   imapHost: string;
   imapPort: number;
+  imapSecurity: "ssl" | "starttls";
+}
+
+/** SMTP endpoint after the fail-closed SMTP configuration gate. */
+interface SecureSmtpEndpoint {
   smtpHost: string;
   smtpPort: number;
-  imapSecurity: "ssl" | "starttls";
   smtpSecurity: "ssl" | "starttls";
 }
 
@@ -87,7 +92,7 @@ export class ImapSmtpProviderFactory implements ProviderFactory {
   public async createImapSession(
     mailbox: MailboxRow,
   ): Promise<ImapSessionProvider> {
-    const endpoints = requireSecureEndpoints(mailbox);
+    const endpoints = requireSecureImapEndpoint(mailbox);
     const cred = await this.decryptCredential(mailbox);
 
     // NOTE: IMAP "starttls" currently maps to implicit TLS (secure=true) — the
@@ -110,7 +115,7 @@ export class ImapSmtpProviderFactory implements ProviderFactory {
   public async createSubmission(
     mailbox: MailboxRow,
   ): Promise<SubmissionProvider> {
-    const endpoints = requireSecureEndpoints(mailbox);
+    const endpoints = requireSecureSmtpEndpoint(mailbox);
     const cred = await this.decryptCredential(mailbox);
 
     const smtp = new NodemailerSmtpClient({
@@ -163,29 +168,45 @@ export class ImapSmtpProviderFactory implements ProviderFactory {
 }
 
 /**
- * Fail-closed transport-config gate, shared by BOTH factory methods. A mailbox
- * row whose imap_security or smtp_security is 'none' (or unset) must NEVER
- * produce a cleartext session that would carry the credential and message
- * bytes in plaintext — even for the capability that would not use that
- * protocol (config integrity is checked as a whole). Runs BEFORE any
- * credential is read or decrypted.
+ * Fail-closed IMAP-config gate (createImapSession only). A mailbox row whose
+ * imap_security is 'none' (or unset) — or which is missing its IMAP host/port —
+ * must NEVER produce a cleartext IMAP session that would carry the credential
+ * and message bytes in plaintext. It says NOTHING about the SMTP config, so a
+ * sync-only mailbox (null smtpHost/smtpPort/smtpSecurity) opens an IMAP session
+ * cleanly. Runs BEFORE any credential is read or decrypted.
  */
-function requireSecureEndpoints(mailbox: MailboxRow): SecureEndpoints {
-  if (
-    mailbox.imapHost === null ||
-    mailbox.imapPort === null ||
-    mailbox.smtpHost === null ||
-    mailbox.smtpPort === null
-  ) {
+function requireSecureImapEndpoint(mailbox: MailboxRow): SecureImapEndpoint {
+  if (mailbox.imapHost === null || mailbox.imapPort === null) {
     throw new TransportError(
       "config_invalid",
-      "mailbox missing host/port config",
+      "mailbox missing imap host/port config",
     );
   }
   if (mailbox.imapSecurity === "none" || mailbox.imapSecurity === null) {
     throw new TransportError(
       "config_invalid",
       "mailbox imap_security must be ssl or starttls (plaintext refused)",
+    );
+  }
+  return {
+    imapHost: mailbox.imapHost,
+    imapPort: mailbox.imapPort,
+    imapSecurity: mailbox.imapSecurity,
+  };
+}
+
+/**
+ * Fail-closed SMTP-config gate (createSubmission only). A mailbox row whose
+ * smtp_security is 'none' (or unset) — or which is missing its SMTP host/port —
+ * must NEVER produce a cleartext submission. It says NOTHING about the IMAP
+ * config, so a send-only construction does not require IMAP. Runs BEFORE any
+ * credential is read or decrypted.
+ */
+function requireSecureSmtpEndpoint(mailbox: MailboxRow): SecureSmtpEndpoint {
+  if (mailbox.smtpHost === null || mailbox.smtpPort === null) {
+    throw new TransportError(
+      "config_invalid",
+      "mailbox missing smtp host/port config",
     );
   }
   if (mailbox.smtpSecurity === "none" || mailbox.smtpSecurity === null) {
@@ -195,11 +216,8 @@ function requireSecureEndpoints(mailbox: MailboxRow): SecureEndpoints {
     );
   }
   return {
-    imapHost: mailbox.imapHost,
-    imapPort: mailbox.imapPort,
     smtpHost: mailbox.smtpHost,
     smtpPort: mailbox.smtpPort,
-    imapSecurity: mailbox.imapSecurity,
     smtpSecurity: mailbox.smtpSecurity,
   };
 }

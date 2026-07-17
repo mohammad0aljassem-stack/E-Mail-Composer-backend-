@@ -91,6 +91,8 @@ export async function buildFixture(options?: {
     confirmedBy: USER_ID,
     confirmationProof: "",
     contractVersion: 1,
+    proofVersion: 1,
+    draftVersionId: null,
   };
   intent.confirmationProof = recomputeConfirmationProof(intent);
 

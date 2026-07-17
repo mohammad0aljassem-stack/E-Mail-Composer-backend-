@@ -1,30 +1,52 @@
 import type {
   DraftMirrorRow,
-  DraftVersionRow,
   MailboxFolderRow,
   MailboxRow,
   MailMessageMeta,
+  MimeArtifactRow,
+  MirrorSnapshotRow,
   SendAttemptRow,
   SendIntentRow,
+  SendSnapshotRow,
   StoredCredential,
   SyncRequestRow,
 } from "../domain/models.js";
+import {
+  MimeArtifactError,
+  SnapshotUnavailableError,
+} from "../domain/errors.js";
 import type { SendState } from "../domain/send-state.js";
 import type {
   AuditWriter,
   CredentialReader,
   DraftMirrorStore,
-  DraftVersionReader,
   FolderStore,
   HeartbeatWriter,
   MailboxReader,
   MessageStore,
+  MimeArtifactStore,
+  MirrorSnapshotReader,
   SendAttemptStore,
   SendIntentReader,
+  SendSnapshotReader,
   SyncRequestStore,
   WorkerClaimStore,
 } from "./repository-interfaces.js";
 import type { Queryable } from "./pool.js";
+
+/**
+ * True when a driver error is the given Postgres SQLSTATE. The private snapshot
+ * accessors raise a uniform P0002 for every missing/legacy/inconsistent case;
+ * we map ONLY that to a content-free SnapshotUnavailableError and never surface
+ * the driver message (which could name a column).
+ */
+function isPgError(err: unknown, code: string): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { code?: unknown }).code === code
+  );
+}
 
 /**
  * Repositories over the canonical transport schema, executed as the
@@ -390,48 +412,82 @@ export class DraftMirrorRepository implements DraftMirrorStore {
 }
 
 // ---------------------------------------------------------------------------
-// Draft versions (immutable snapshots; SELECT only — never written here)
+// Confirmed-send snapshots (PRIVATE worker accessors; EXECUTE only)
 // ---------------------------------------------------------------------------
 /**
- * SELECT-only reader over public.draft_versions for the EXACT confirmed
- * source_revision. NOTE (deployment gap, fail-closed by design): the canonical
- * migrations grant transport_worker NO privilege on public.draft_versions
- * (see the 20260713100000 grant block — mailboxes/send_intents/... only), so
- * under the real worker role this SELECT raises and the payload resolver fails
- * CLOSED with the content-free code `draft_version_unreadable`. Enabling
- * MAIL_SEND_ENABLED in a real environment therefore requires a FUTURE additive
- * UI-owned grant migration (SELECT on public.draft_versions to
- * transport_worker). No grant is added anywhere in this repo — not even in
- * test SQL; the integration suite asserts the denial instead.
+ * The worker's ONLY read path for confirmed SEND content: the private
+ * transport.get_send_snapshot(send_intent_id) SECURITY DEFINER function
+ * (20260716100000). The worker has EXECUTE on it (canonical grant) but NO table
+ * grant on public.draft_versions, so it can never read the mutable draft, a
+ * near-miss revision, or a caller-supplied snapshot id — the intent id is the
+ * sole key. The function raises a uniform P0002 for a missing/legacy/
+ * inconsistent intent; we map ONLY that to a content-free
+ * SnapshotUnavailableError (the resolver fails closed — zero SMTP bytes).
  */
-export class DraftVersionRepository implements DraftVersionReader {
+export class SendSnapshotRepository implements SendSnapshotReader {
   public constructor(private readonly db: Queryable) {}
 
-  public async findDraftVersion(
+  public async getSendSnapshot(sendIntentId: string): Promise<SendSnapshotRow> {
+    let r;
+    try {
+      r = await this.db.query(
+        `select draft_version_id, workspace_id, draft_id, source_revision,
+                version_no, subject, body_json
+           from transport.get_send_snapshot($1)`,
+        [sendIntentId],
+      );
+    } catch (err) {
+      if (isPgError(err, "P0002")) throw new SnapshotUnavailableError();
+      throw err;
+    }
+    const row = r.rows[0];
+    if (row === undefined) throw new SnapshotUnavailableError();
+    return {
+      draftVersionId: row.draft_version_id as string,
+      workspaceId: row.workspace_id as string,
+      draftId: row.draft_id as string,
+      sourceRevision: req(row.source_revision),
+      versionNo: req(row.version_no),
+      subject: row.subject as string,
+      bodyJson: row.body_json,
+    };
+  }
+}
+
+/**
+ * The worker's read path for MIRRORING a known revision: the private
+ * transport.get_mirror_snapshot(workspace_id, draft_id, source_revision)
+ * SECURITY DEFINER function (20260716100000). Returns the newest snapshot for
+ * that EXACT triple; a uniform P0002 (no such snapshot — including any workspace
+ * mismatch) becomes a content-free SnapshotUnavailableError, which the mirror
+ * resolver maps to a skip. Never used for sending.
+ */
+export class MirrorSnapshotRepository implements MirrorSnapshotReader {
+  public constructor(private readonly db: Queryable) {}
+
+  public async getMirrorSnapshot(
     workspaceId: string,
     draftId: string,
     sourceRevision: bigint,
-  ): Promise<DraftVersionRow | null> {
-    const r = await this.db.query(
-      `select id, workspace_id, draft_id, version_no, source_revision,
-              subject, body_json, created_at
-         from public.draft_versions
-        where workspace_id = $1 and draft_id = $2 and source_revision = $3
-        order by version_no desc
-        limit 1`,
-      [workspaceId, draftId, sourceRevision.toString()],
-    );
+  ): Promise<MirrorSnapshotRow> {
+    let r;
+    try {
+      r = await this.db.query(
+        `select draft_version_id, version_no, subject, body_json
+           from transport.get_mirror_snapshot($1, $2, $3)`,
+        [workspaceId, draftId, sourceRevision.toString()],
+      );
+    } catch (err) {
+      if (isPgError(err, "P0002")) throw new SnapshotUnavailableError();
+      throw err;
+    }
     const row = r.rows[0];
-    if (row === undefined) return null;
+    if (row === undefined) throw new SnapshotUnavailableError();
     return {
-      id: row.id as string,
-      workspaceId: row.workspace_id as string,
-      draftId: row.draft_id as string,
+      draftVersionId: row.draft_version_id as string,
       versionNo: req(row.version_no),
-      sourceRevision: req(row.source_revision),
       subject: row.subject as string,
       bodyJson: row.body_json,
-      createdAt: new Date(row.created_at as string),
     };
   }
 }
@@ -472,6 +528,8 @@ export class SendIntentRepository implements SendIntentReader {
       confirmedBy: row.confirmed_by as string,
       confirmationProof: row.confirmation_proof as string,
       contractVersion: row.contract_version as number,
+      proofVersion: row.proof_version as number,
+      draftVersionId: (row.draft_version_id as string | null) ?? null,
     };
   }
 }
@@ -563,6 +621,90 @@ export class SendAttemptRepository implements SendAttemptStore {
       smtpResponse: (row.smtp_response as string | null) ?? null,
       evidence: (row.evidence as SendAttemptRow["evidence"]) ?? {},
       version: req(row.version),
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Exact MIME artifacts (PRIVATE transport schema; worker EXECUTE + SELECT/UPDATE)
+// ---------------------------------------------------------------------------
+/**
+ * The worker's exact-MIME-artifact store. Creation goes EXCLUSIVELY through the
+ * SECURITY DEFINER function transport.create_or_verify_send_mime_artifact (the
+ * worker has EXECUTE on it and NO direct INSERT — the function INSERTs as its
+ * definer): this class issues NO direct INSERT on the table.
+ * The function first-creates the artifact only while the attempt is 'claimed'
+ * and re-hashes the caller bytes on every call, VERIFYING on a second identical
+ * call (restart/reconciliation); a uniform 23514 becomes a content-free
+ * MimeArtifactError. `getBySendAttempt` is a plain SELECT (worker grant) that
+ * loads the EXACT stored bytes for the Sent-copy append on restart.
+ */
+export class MimeArtifactRepository implements MimeArtifactStore {
+  public constructor(private readonly db: Queryable) {}
+
+  public async createOrVerify(input: {
+    sendAttemptId: string;
+    sendIntentId: string;
+    workspaceId: string;
+    messageId: string;
+    mimeSha256: string;
+    sizeBytes: bigint;
+    rawMime: Buffer;
+  }): Promise<MimeArtifactRow> {
+    let r;
+    try {
+      r = await this.db.query(
+        `select id, send_attempt_id, send_intent_id, workspace_id, message_id,
+                mime_sha256, size_bytes, raw_mime, cleared_at
+           from transport.create_or_verify_send_mime_artifact(
+             $1, $2, $3, $4, $5, $6, $7)`,
+        [
+          input.sendAttemptId,
+          input.sendIntentId,
+          input.workspaceId,
+          input.messageId,
+          input.mimeSha256,
+          input.sizeBytes.toString(),
+          input.rawMime,
+        ],
+      );
+    } catch (err) {
+      // The function raises a uniform, non-disclosing 23514 for every
+      // create/verify rejection. Map ONLY that to a content-free error; never
+      // surface the driver message.
+      if (isPgError(err, "23514")) throw new MimeArtifactError();
+      throw err;
+    }
+    const row = r.rows[0];
+    if (row === undefined) throw new MimeArtifactError();
+    return this.map(row);
+  }
+
+  public async getBySendAttempt(
+    sendAttemptId: string,
+  ): Promise<MimeArtifactRow | null> {
+    const r = await this.db.query(
+      `select id, send_attempt_id, send_intent_id, workspace_id, message_id,
+              mime_sha256, size_bytes, raw_mime, cleared_at
+         from transport.send_mime_artifacts
+        where send_attempt_id = $1`,
+      [sendAttemptId],
+    );
+    const row = r.rows[0];
+    return row === undefined ? null : this.map(row);
+  }
+
+  private map(row: Record<string, unknown>): MimeArtifactRow {
+    return {
+      id: row.id as string,
+      sendAttemptId: row.send_attempt_id as string,
+      sendIntentId: row.send_intent_id as string,
+      workspaceId: row.workspace_id as string,
+      messageId: row.message_id as string,
+      mimeSha256: row.mime_sha256 as string,
+      sizeBytes: req(row.size_bytes),
+      rawMime: (row.raw_mime as Buffer | null) ?? null,
+      clearedAt: date(row.cleared_at),
     };
   }
 }
@@ -699,23 +841,27 @@ export class SyncRequestRepository implements SyncRequestStore {
   }
 
   /**
-   * Fenced lease renewal (single atomic CAS on claimed_at). Succeeds ONLY when
-   * the row is still `claimed` AND claimed_at equals the exact token the caller
-   * holds; a lost CAS (another claimant re-claimed, or the request went
-   * terminal) returns null and the caller must stop without marking anything.
-   * attempt_count is deliberately NOT touched: renewals are not re-claims.
+   * Fenced lease renewal (single atomic CAS on the generation+token tuple).
+   * Succeeds ONLY when the row is still `claimed` AND attempt_count equals the
+   * generation the caller holds AND claimed_at equals the exact token the caller
+   * holds; a lost CAS (another claimant re-claimed — bumping generation and/or
+   * moving the token — or the request went terminal) returns null and the caller
+   * must stop without marking anything. attempt_count is deliberately NOT touched:
+   * renewals are not re-claims (the generation is unchanged; only the token moves).
    */
   public async renewLease(
     id: string,
+    expectedGeneration: number,
     prevClaimedAt: Date,
     now: Date,
   ): Promise<Date | null> {
     const r = await this.db.query(
       `update transport.sync_requests
-          set claimed_at = $3
-        where id = $1 and status = 'claimed' and claimed_at = $2
+          set claimed_at = $4
+        where id = $1 and status = 'claimed'
+          and attempt_count = $2 and claimed_at = $3
       returning claimed_at`,
-      [id, prevClaimedAt, now],
+      [id, expectedGeneration, prevClaimedAt, now],
     );
     const row = r.rows[0];
     return row === undefined ? null : date(row.claimed_at);
@@ -723,14 +869,17 @@ export class SyncRequestRepository implements SyncRequestStore {
 
   public async markCompleted(
     id: string,
+    expectedGeneration: number,
+    expectedToken: Date,
     now: Date,
   ): Promise<SyncRequestRow | null> {
     const r = await this.db.query(
       `update transport.sync_requests
-          set status = 'completed', completed_at = $2
+          set status = 'completed', completed_at = $4
         where id = $1 and status = 'claimed'
+          and attempt_count = $2 and claimed_at = $3
       returning *`,
-      [id, now],
+      [id, expectedGeneration, expectedToken, now],
     );
     const row = r.rows[0];
     return row === undefined ? null : this.map(row);
@@ -738,15 +887,24 @@ export class SyncRequestRepository implements SyncRequestStore {
 
   public async markFailed(input: {
     id: string;
+    expectedGeneration: number;
+    expectedToken: Date;
     now: Date;
     lastError: string;
   }): Promise<SyncRequestRow | null> {
     const r = await this.db.query(
       `update transport.sync_requests
-          set status = 'failed', completed_at = $2, last_error = $3
-        where id = $1 and status in ('claimed', 'pending')
+          set status = 'failed', completed_at = $4, last_error = $5
+        where id = $1 and status = 'claimed'
+          and attempt_count = $2 and claimed_at = $3
       returning *`,
-      [input.id, input.now, boundedCode(input.lastError)],
+      [
+        input.id,
+        input.expectedGeneration,
+        input.expectedToken,
+        input.now,
+        boundedCode(input.lastError),
+      ],
     );
     const row = r.rows[0];
     return row === undefined ? null : this.map(row);
@@ -806,7 +964,7 @@ export class SyncRequestRepository implements SyncRequestStore {
  * boundary too (belt and suspenders with the DB CHECK <= 2000): a short code
  * only, never any body/MIME/credential/provider payload.
  */
-function boundedCode(code: string): string {
+export function boundedCode(code: string): string {
   return code.slice(0, 200);
 }
 

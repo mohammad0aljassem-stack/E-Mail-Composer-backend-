@@ -29,6 +29,8 @@ export type TransportErrorCode =
   | "send_precondition_failed"
   | "send_ambiguous"
   | "send_pre_data_failed"
+  | "mime_artifact_rejected"
+  | "snapshot_unavailable"
   | "state_conflict"
   | "not_found"
   | "provisioning_refused";
@@ -55,6 +57,46 @@ export class TransportError extends Error {
     this.code = code;
     this.retryable = options?.retryable ?? false;
     this.context = Object.freeze({ ...(options?.context ?? {}) });
+  }
+}
+
+/**
+ * The private snapshot accessor (transport.get_send_snapshot /
+ * transport.get_mirror_snapshot) refused to return a snapshot: the intent is
+ * missing, legacy (proof-v1 / contract != 2), or its bound draft_versions row is
+ * missing/inconsistent — the function raises a single uniform P0002 for all of
+ * them, so the worker cannot (and must not) tell which. Content-free by
+ * construction: it names no column, body, or identifier. Fail-closed — the send
+ * path never constructs SMTP, the mirror path skips.
+ */
+export class SnapshotUnavailableError extends TransportError {
+  public constructor(context?: Record<string, string | number | boolean>) {
+    super("snapshot_unavailable", "confirmed snapshot not available", {
+      retryable: false,
+      ...(context !== undefined ? { context } : {}),
+    });
+    this.name = "SnapshotUnavailableError";
+  }
+}
+
+/**
+ * The private exact-MIME persistence path
+ * (transport.create_or_verify_send_mime_artifact) refused to create or verify an
+ * artifact: the attempt was not exactly 'claimed', the parent chain
+ * (attempt/intent/workspace/message_id) was inconsistent, the exact-bytes
+ * hash/size/25MiB-bound did not hold, or a restart/reconciliation VERIFY diverged
+ * from the stored durable digest/size/bytes. The function raises a single uniform
+ * 23514 for all of them, so the worker cannot (and must not) tell which. Content-
+ * free by construction: names no column, body, or identifier. Fail-closed — the
+ * send path never constructs SMTP.
+ */
+export class MimeArtifactError extends TransportError {
+  public constructor(context?: Record<string, string | number | boolean>) {
+    super("mime_artifact_rejected", "MIME artifact create/verify refused", {
+      retryable: false,
+      ...(context !== undefined ? { context } : {}),
+    });
+    this.name = "MimeArtifactError";
   }
 }
 

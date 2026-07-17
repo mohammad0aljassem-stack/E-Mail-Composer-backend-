@@ -3,7 +3,7 @@
 A production-quality, **fully locally-testable** foundation for the IMAP/SMTP
 transport worker. This repository owns the **backend worker**; the canonical
 database schema and all deployable migrations are owned by the sibling UI repo
-(`E-Mail-Composer-UI`, merged commit `44c62c630b1db6bbdbcf5c95863bd3b896a77c99`).
+(`E-Mail-Composer-UI`, merged commit `4bca2fc927c552f6466d9e8124e9b07c9770d1c1`).
 
 The backend is pinned to that contract by a **single source of truth**:
 [`config/canonical-transport-contract.lock.json`](config/canonical-transport-contract.lock.json)

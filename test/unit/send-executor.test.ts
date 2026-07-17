@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { JsonLogger } from "../../src/observability/logger.js";
 import {
+  buildOutboundMime,
+  sha256Hex,
+} from "../../src/mime/outbound-builder.js";
+import {
   SendExecutor,
   type SendExecutorDeps,
 } from "../../src/workers/send-executor.js";
@@ -13,6 +17,7 @@ import {
   FakeAuditRepo,
   FakeFolderRepo,
   FakeMailboxRepo,
+  FakeMimeArtifactRepo,
   FakeSendAttemptRepo,
   FakeSendIntentRepo,
   FakeWorkerClaimRepo,
@@ -38,13 +43,23 @@ interface Harness {
   audit: FakeAuditRepo;
   claims: FakeWorkerClaimRepo;
   folders: FakeFolderRepo;
+  mimeArtifacts: FakeMimeArtifactRepo;
   smtp: FakeSmtpClient;
   server: FakeImapServer;
   factory: FakeProviderFactory;
   fixture: BuiltFixture;
   logLines: string[];
   setState: (state: SendState, version?: bigint) => void;
+  /**
+   * Seed a retained MIME artifact for the attempt, as if a prior execution had
+   * persisted it before SMTP. Builds the exact bytes (pinned date) so the
+   * restart/reconciliation path can append the EXACT stored bytes without ever
+   * rebuilding MIME. Returns the stored Buffer for byte-identity assertions.
+   */
+  seedArtifact: () => Promise<Buffer>;
 }
+
+const PINNED_MIME_DATE = new Date(1_700_000_000_000);
 
 async function makeHarness(options?: {
   payloadOverride?: ResolvedSendPayload;
@@ -65,6 +80,18 @@ async function makeHarness(options?: {
   const claims = new FakeWorkerClaimRepo();
   const audit = new FakeAuditRepo();
   const folders = new FakeFolderRepo();
+
+  // Phase 6: the exact-MIME artifact store + the two cross-guards that mirror
+  // the DB. createOrVerify first-creates only while the attempt is 'claimed'
+  // (attemptState reads the live attempt), and the claimed -> smtp_in_progress
+  // transition is rejected (23514) unless a valid retained artifact exists
+  // (mimeArtifactGuard mirrors trg_send_attempts_require_mime_before_smtp).
+  const mimeArtifacts = new FakeMimeArtifactRepo();
+  mimeArtifacts.attemptState = (id) => attempts.rows.get(id)?.state ?? null;
+  attempts.mimeArtifactGuard = (id) => {
+    const art = mimeArtifacts.rows.get(id);
+    return art !== undefined && art.rawMime !== null;
+  };
 
   const server = new FakeImapServer();
   server.addFolder({ name: "Sent", role: "sent" });
@@ -88,6 +115,7 @@ async function makeHarness(options?: {
     folders,
     claims,
     audit,
+    mimeArtifacts,
     providerFactory: factory,
     payloadResolver,
     clock: new TestClock(),
@@ -106,6 +134,7 @@ async function makeHarness(options?: {
     audit,
     claims,
     folders,
+    mimeArtifacts,
     smtp,
     server,
     factory,
@@ -113,6 +142,19 @@ async function makeHarness(options?: {
     logLines,
     setState: (state, version) =>
       attempts.rows.set(ATTEMPT_ID, fixture.attempt(state, version)),
+    seedArtifact: async () => {
+      const built = await buildOutboundMime(fixture.message, {
+        date: PINNED_MIME_DATE,
+      });
+      const row = mimeArtifacts.seed({
+        sendAttemptId: ATTEMPT_ID,
+        sendIntentId: INTENT_ID,
+        workspaceId: WORKSPACE_ID,
+        messageId: MESSAGE_ID,
+        rawMime: built.raw,
+      });
+      return row.rawMime!;
+    },
   };
 }
 
@@ -284,6 +326,7 @@ describe("SendExecutor — restart safety", () => {
   // Test 30: a restart after smtp_accepted does NOT re-send SMTP.
   it("does not re-send after acceptance; only reconciles the Sent copy", async () => {
     const h = await makeHarness();
+    await h.seedArtifact(); // the prior execution persisted the exact bytes
     h.setState("smtp_accepted", 5n);
     const outcome = await h.exec.execute(JOB);
     expect(outcome).toBe("completed");
@@ -531,6 +574,7 @@ describe("SendExecutor — re-entry pins (T2/T3/T4)", () => {
 
   it("T3: sent_copy_pending re-entry completes via Sent copy, 0 SMTP submissions", async () => {
     const h = await makeHarness();
+    await h.seedArtifact();
     h.setState("sent_copy_pending", 6n);
     const outcome = await h.exec.execute(JOB);
     expect(outcome).toBe("completed");
@@ -640,26 +684,34 @@ describe("SendExecutor — build once, reuse exact bytes (C5)", () => {
     expect(h.smtp.submissions[0]!.raw.toString("utf8")).toContain(pinnedHeader);
   });
 
-  it("restart reconcile rebuilds the Sent copy with the evidence-pinned date", async () => {
+  it("restart reconcile appends the EXACT stored artifact bytes, never rebuilds", async () => {
     const h = await makeHarness();
-    const pinned = "Tue, 30 Jun 2026 09:00:00 GMT";
-    h.attempts.rows.set(ATTEMPT_ID, {
-      ...h.fixture.attempt("smtp_accepted", 5n),
-      evidence: { mime_date: pinned },
-    });
+    const stored = await h.seedArtifact();
+    h.setState("smtp_accepted", 5n);
+    // A rebuild is impossible without re-resolving the payload; assert it is
+    // never called (proxy for buildOutboundMime never running on restart).
+    let resolves = 0;
+    h.deps.payloadResolver = {
+      resolve: () => {
+        resolves += 1;
+        return Promise.resolve(h.fixture.payload);
+      },
+    };
+    h.exec = new SendExecutor(h.deps);
     const outcome = await h.exec.execute(JOB);
     expect(outcome).toBe("completed");
     expect(h.smtp.submissions).toHaveLength(0); // never SMTP again
+    expect(resolves).toBe(0); // never re-resolved => never rebuilt
     const sent = [...h.server.folder("Sent").messages.values()].find(
       (m) => m.messageId === MESSAGE_ID,
     );
-    expect(sent?.raw?.toString("utf8")).toContain(
-      "Date: Tue, 30 Jun 2026 09:00:00 +0000",
-    );
+    // Sent-bytes === artifact-bytes, byte for byte.
+    expect(sent?.raw?.equals(stored)).toBe(true);
   });
 
-  it("reconcile with an existing Sent copy never re-resolves or rebuilds", async () => {
+  it("reconcile with an existing Sent copy never loads or rebuilds bytes", async () => {
     const h = await makeHarness();
+    await h.seedArtifact();
     h.server.seedMessage("Sent", { messageId: MESSAGE_ID });
     h.setState("smtp_accepted", 5n);
     let resolves = 0;
@@ -671,27 +723,200 @@ describe("SendExecutor — build once, reuse exact bytes (C5)", () => {
     };
     h.exec = new SendExecutor(h.deps);
     expect(await h.exec.execute(JOB)).toBe("completed");
-    // findByMessageId runs FIRST; the raw bytes are only rematerialized when
-    // an append is actually needed.
+    // findByMessageId runs FIRST; the stored bytes are only loaded when an
+    // append is actually needed — here it never is.
     expect(resolves).toBe(0);
   });
 
-  it("parks sent_copy_pending when a restart rebuild diverges from the intent", async () => {
+  it("parks sent_copy_pending when no stored artifact is available on restart", async () => {
     const h = await makeHarness();
+    // No artifact was persisted (or it was lost): the restart path must NEVER
+    // rebuild and NEVER re-enter SMTP — it fails closed to sent_copy_pending.
     h.setState("smtp_accepted", 5n);
-    h.deps.payloadResolver = {
-      resolve: () =>
-        Promise.resolve({
-          revision: h.fixture.payload.revision,
-          message: { ...h.fixture.message, html: "<p>tampered later</p>" },
-        }),
-    };
-    h.exec = new SendExecutor(h.deps);
     const outcome = await h.exec.execute(JOB);
-    // Divergent bytes are NEVER appended, and SMTP is never re-entered.
     expect(outcome).toBe("sent_copy_pending");
     expect(h.server.folder("Sent").messages.size).toBe(0);
     expect(h.smtp.submissions).toHaveLength(0);
+  });
+});
+
+describe("SendExecutor — exact MIME artifact persistence (Phase 6)", () => {
+  // The artifact is persisted (createOrVerify) BEFORE the claimed ->
+  // smtp_in_progress transition, so the exact bytes exist before any SMTP byte.
+  it("persists the artifact BEFORE the smtp_in_progress transition", async () => {
+    const h = await makeHarness();
+    const order: string[] = [];
+    const origCreate = h.mimeArtifacts.createOrVerify.bind(h.mimeArtifacts);
+    h.mimeArtifacts.createOrVerify = (input) => {
+      order.push("createOrVerify");
+      return origCreate(input);
+    };
+    const origCas = h.attempts.compareAndSet.bind(h.attempts);
+    h.attempts.compareAndSet = (input) => {
+      if (input.toState === "smtp_in_progress") order.push("smtp_in_progress");
+      return origCas(input);
+    };
+    h.exec = new SendExecutor(h.deps);
+    expect(await h.exec.execute(JOB)).toBe("completed");
+    expect(order.indexOf("createOrVerify")).toBeGreaterThan(-1);
+    expect(order.indexOf("createOrVerify")).toBeLessThan(
+      order.indexOf("smtp_in_progress"),
+    );
+    expect(h.mimeArtifacts.createOrVerifyCalls).toBe(1);
+  });
+
+  // The DB ordering guard (trg_send_attempts_require_mime_before_smtp) rejects a
+  // claimed -> smtp_in_progress transition with no valid retained artifact.
+  it("the fake attempt store rejects claimed -> smtp_in_progress without an artifact (23514)", async () => {
+    const attempts = new FakeSendAttemptRepo();
+    attempts.mimeArtifactGuard = () => false; // no valid retained artifact
+    attempts.rows.set(ATTEMPT_ID, {
+      id: ATTEMPT_ID,
+      workspaceId: WORKSPACE_ID,
+      sendIntentId: INTENT_ID,
+      state: "claimed",
+      claimedBy: "w",
+      claimedAt: new Date(),
+      messageId: MESSAGE_ID,
+      smtpResponse: null,
+      evidence: {},
+      version: 3n,
+    });
+    await expect(
+      attempts.compareAndSet({
+        id: ATTEMPT_ID,
+        expectedVersion: 3n,
+        expectedState: "claimed",
+        toState: "smtp_in_progress",
+      }),
+    ).rejects.toMatchObject({ code: "23514" });
+  });
+
+  // Executor maps that guard 23514 to failed_before_delivery with ZERO SMTP.
+  it("fails closed (zero SMTP) when the ordering guard rejects the transition", async () => {
+    const h = await makeHarness();
+    h.attempts.mimeArtifactGuard = () => false; // guard rejects at the boundary
+    const outcome = await h.exec.execute(JOB);
+    expect(outcome).toBe("failed_before_delivery");
+    expect(h.smtp.submissions).toHaveLength(0);
+    expect(h.attempts.rows.get(ATTEMPT_ID)?.evidence.reason).toBe(
+      "mime_artifact_missing_before_smtp",
+    );
+  });
+
+  // The EXACT bytes submitted to SMTP === the persisted artifact bytes.
+  it("submits the EXACT persisted artifact bytes to SMTP (byte compare)", async () => {
+    const h = await makeHarness();
+    await h.exec.execute(JOB);
+    const submitted = h.smtp.submissions[0]!.raw;
+    const artifact = h.mimeArtifacts.rows.get(ATTEMPT_ID)!;
+    expect(artifact.rawMime).not.toBeNull();
+    expect(submitted.equals(artifact.rawMime!)).toBe(true);
+  });
+
+  // The EXACT bytes appended to Sent === the persisted artifact bytes.
+  it("appends the EXACT persisted artifact bytes to Sent (byte compare)", async () => {
+    const h = await makeHarness();
+    await h.exec.execute(JOB);
+    const artifact = h.mimeArtifacts.rows.get(ATTEMPT_ID)!;
+    const sent = [...h.server.folder("Sent").messages.values()].find(
+      (m) => m.messageId === MESSAGE_ID,
+    );
+    expect(sent?.raw?.equals(artifact.rawMime!)).toBe(true);
+  });
+
+  // Forged / divergent artifact bytes → create-or-verify rejects (uniform
+  // 23514) → failed_before_delivery, ZERO SMTP, submission never constructed.
+  it("fails closed with zero SMTP when the persisted artifact diverges (forged bytes)", async () => {
+    const h = await makeHarness();
+    h.mimeArtifacts.seed({
+      sendAttemptId: ATTEMPT_ID,
+      sendIntentId: INTENT_ID,
+      workspaceId: WORKSPACE_ID,
+      messageId: MESSAGE_ID,
+      rawMime: Buffer.from(
+        "forged divergent bytes not matching the built MIME",
+      ),
+    });
+    const outcome = await h.exec.execute(JOB);
+    expect(outcome).toBe("failed_before_delivery");
+    expect(h.smtp.submissions).toHaveLength(0);
+    expect(h.factory.submissionsCreated).toBe(0); // never even constructed
+    expect(h.attempts.rows.get(ATTEMPT_ID)?.evidence.reason).toBe(
+      "mime_artifact_rejected",
+    );
+  });
+
+  // A restart (smtp_accepted, artifact present) uses the STORED bytes and does
+  // NOT re-resolve/rebuild MIME and does NOT submit SMTP again.
+  it("restart uses stored bytes, never rebuilds, never re-submits SMTP", async () => {
+    const h = await makeHarness();
+    const stored = await h.seedArtifact();
+    h.setState("smtp_accepted", 5n);
+    let resolves = 0;
+    h.deps.payloadResolver = {
+      resolve: () => {
+        resolves += 1;
+        return Promise.resolve(h.fixture.payload);
+      },
+    };
+    h.exec = new SendExecutor(h.deps);
+    expect(await h.exec.execute(JOB)).toBe("completed");
+    expect(h.smtp.submissions).toHaveLength(0);
+    expect(resolves).toBe(0);
+    const sent = [...h.server.folder("Sent").messages.values()].find(
+      (m) => m.messageId === MESSAGE_ID,
+    );
+    expect(sent?.raw?.equals(stored)).toBe(true);
+  });
+
+  // No SMTP resend from sent_copy_pending — reconcile only, using stored bytes.
+  it("reconciles sent_copy_pending from stored bytes with zero SMTP", async () => {
+    const h = await makeHarness();
+    await h.seedArtifact();
+    h.setState("sent_copy_pending", 6n);
+    expect(await h.exec.execute(JOB)).toBe("completed");
+    expect(h.smtp.submissions).toHaveLength(0);
+    expect(h.factory.submissionsCreated).toBe(0);
+  });
+
+  // create-or-verify is idempotent: an identical replay returns the same row.
+  it("createOrVerify is idempotent — identical replay returns the same artifact", async () => {
+    const repo = new FakeMimeArtifactRepo();
+    repo.attemptState = () => "claimed";
+    const raw = Buffer.from("exact mime bytes for idempotency");
+    const input = {
+      sendAttemptId: ATTEMPT_ID,
+      sendIntentId: INTENT_ID,
+      workspaceId: WORKSPACE_ID,
+      messageId: MESSAGE_ID,
+      mimeSha256: sha256Hex(raw),
+      sizeBytes: BigInt(raw.length),
+      rawMime: raw,
+    };
+    const first = await repo.createOrVerify(input);
+    const second = await repo.createOrVerify(input);
+    expect(second.id).toBe(first.id);
+    expect(second.mimeSha256).toBe(first.mimeSha256);
+    expect(repo.createOrVerifyCalls).toBe(2);
+  });
+
+  // A first-create while the attempt is NOT 'claimed' is rejected (state gate).
+  it("createOrVerify refuses a first-create unless the attempt is claimed", async () => {
+    const repo = new FakeMimeArtifactRepo();
+    repo.attemptState = () => "queued"; // not claimed
+    const raw = Buffer.from("bytes");
+    await expect(
+      repo.createOrVerify({
+        sendAttemptId: ATTEMPT_ID,
+        sendIntentId: INTENT_ID,
+        workspaceId: WORKSPACE_ID,
+        messageId: MESSAGE_ID,
+        mimeSha256: sha256Hex(raw),
+        sizeBytes: BigInt(raw.length),
+        rawMime: raw,
+      }),
+    ).rejects.toMatchObject({ code: "mime_artifact_rejected" });
   });
 });
 

@@ -9,6 +9,7 @@ import {
 import { Heartbeat } from "../../src/observability/heartbeat.js";
 import { MutationExecutor } from "../../src/workers/mutation-executor.js";
 import { JsonLogger } from "../../src/observability/logger.js";
+import { boundedCode } from "../../src/db/repositories.js";
 import {
   FakeAuditRepo,
   FakeHeartbeatRepo,
@@ -33,6 +34,19 @@ describe("RandomIdGenerator", () => {
     // A hostile domain is replaced with a safe default.
     expect(g.messageId("bad domain>")).toMatch(/@mail\.local>$/);
     expect(g.workerId()).toMatch(/^worker-/);
+  });
+});
+
+describe("boundedCode — bounded, content-free last_error invariant", () => {
+  it("passes a short code through unchanged", () => {
+    expect(boundedCode("sync_failed")).toBe("sync_failed");
+    expect(boundedCode("attempts_exhausted")).toBe("attempts_exhausted");
+  });
+
+  it("truncates an over-long input to the 200-char bound (belt-and-suspenders with the DB CHECK)", () => {
+    const bounded = boundedCode("x".repeat(5000));
+    expect(bounded.length).toBe(200);
+    expect(bounded).toBe("x".repeat(200));
   });
 });
 

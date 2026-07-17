@@ -26,7 +26,12 @@ function batch(needsFollowUp: boolean, lastSeenUid: bigint): SyncResult {
 }
 
 interface Continuation {
-  job: SyncMailboxJob & { syncRequestId: string; cursorUid: string };
+  job: SyncMailboxJob & {
+    syncRequestId: string;
+    cursorUid: string;
+    claimGeneration: number;
+    claimToken: string;
+  };
   key: string;
 }
 
@@ -79,6 +84,7 @@ function makeHarness(options: {
           job,
           key: singletonKeys.syncRequestContinuation(
             job.syncRequestId,
+            job.claimGeneration,
             job.cursorUid,
           ),
         });
@@ -124,6 +130,10 @@ function claimedRequest(h: Harness): {
       folder: "INBOX",
       mode: "incremental",
       syncRequestId: row.id,
+      // The dispatcher stamps the fencing tuple on the payload: the claim's
+      // generation (attempt_count) and token (claimed_at as an ISO string).
+      claimGeneration: row.attemptCount,
+      claimToken: row.claimedAt!.toISOString(),
     },
   };
 }
@@ -194,10 +204,11 @@ describe("runSyncJob — bound hit -> cursor-keyed continuation", () => {
     // Invariant: every continuation carries the ORIGINAL durable request id.
     expect(cont.job.syncRequestId).toBe(id);
     expect(cont.job.mode).toBe("incremental");
-    // Cursor-distinct deterministic key (never the original sync-req:{id}).
+    // Cursor-distinct, generation-scoped key (never the dispatch key).
     expect(cont.job.cursorUid).toBe("400");
-    expect(cont.key).toBe(`sync-req:${id}:uid:400`);
-    expect(cont.key).not.toBe(singletonKeys.syncRequest(id));
+    expect(cont.job.claimGeneration).toBe(1);
+    expect(cont.key).toBe(`sync-req:${id}:gen:1:uid:400`);
+    expect(cont.key).not.toBe(singletonKeys.syncRequest(id, 1));
     // NOT completed — the continuation owns the remaining backlog.
     const after = await h.syncRequests.getById(id);
     expect(after?.status).toBe("claimed");
@@ -279,8 +290,18 @@ describe("runSyncJob — lease fencing (single effective claimant)", () => {
       attemptCount: 1,
     });
     const token = row.claimedAt!;
-    const a = await repo.renewLease(row.id, token, new Date(clock.nowMs() + 1));
-    const b = await repo.renewLease(row.id, token, new Date(clock.nowMs() + 2));
+    const a = await repo.renewLease(
+      row.id,
+      1,
+      token,
+      new Date(clock.nowMs() + 1),
+    );
+    const b = await repo.renewLease(
+      row.id,
+      1,
+      token,
+      new Date(clock.nowMs() + 2),
+    );
     expect(a).not.toBeNull();
     expect(b).toBeNull(); // the loser's token is stale
     // A renewal never touches attempt_count and never changes status.
@@ -321,7 +342,13 @@ describe("runSyncJob — failure semantics", () => {
     const { id, jobData } = claimedRequest(h);
     // The other claimant completed it while our (stale) job was failing.
     h.onBatch = async () => {
-      await h.syncRequests.markCompleted(id, h.clock.now());
+      const row = (await h.syncRequests.getById(id))!;
+      await h.syncRequests.markCompleted(
+        id,
+        row.attemptCount,
+        row.claimedAt!,
+        h.clock.now(),
+      );
     };
     await expect(
       runSyncJob(h.deps, jobData, { finalAttempt: true }),

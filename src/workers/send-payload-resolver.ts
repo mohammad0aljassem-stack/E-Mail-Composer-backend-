@@ -1,21 +1,27 @@
 import { TransportError } from "../domain/errors.js";
-import type { DraftVersionRow, SendIntentRow } from "../domain/models.js";
-import type { DraftVersionReader } from "../db/repository-interfaces.js";
+import type { SendIntentRow } from "../domain/models.js";
+import type { SendSnapshotReader } from "../db/repository-interfaces.js";
 import { renderDraftBody } from "../mime/draft-renderer.js";
 import type { ResolvedSendPayload, SendPayloadResolver } from "./ports.js";
 
 /**
- * Production send-payload resolver (Phase 3B C4): reconstructs the confirmed
- * body for an IMMUTABLE send intent from the append-only draft snapshot table.
+ * Production send-payload resolver (Phase 3B, contract v2): reconstructs the
+ * confirmed body for an IMMUTABLE send intent from the EXACT draft snapshot the
+ * intent is bound to — resolved by send_intent_id through the private
+ * transport.get_send_snapshot(send_intent_id) function.
  *
  * Source hierarchy (exactly, in order):
  *  1. The immutable send_intents row itself — sender, recipients, subject and
  *     Message-ID are ECHOED from the intent, never substituted; the executor's
  *     verifyIntegrity proves the echo.
- *  2. The public.draft_versions snapshot with the intent's EXACT
- *     source_revision (highest version_no if several). The mutable drafts row
- *     is NEVER read — this resolver deliberately has no drafts dependency, so
- *     later edits cannot leak into a confirmed send.
+ *  2. The confirmed snapshot the intent is bound to, obtained SOLELY via
+ *     getSendSnapshot(intent.id). The function returns exactly the
+ *     draft_versions row referenced by the intent's draft_version_id and only
+ *     when the intent is a fully-formed v2 confirmation whose snapshot matches
+ *     its EXACT workspace/draft/revision. The worker has NO grant on
+ *     public.draft_versions and NEVER reads the mutable draft, a near-miss
+ *     revision, the newest snapshot, or a caller-supplied snapshot id — so a
+ *     later edit or a legacy (proof-v1) intent can never leak into a send.
  *  3. The deterministic worker renderer (../mime/draft-renderer.js) turns the
  *     snapshot's body_json into html + text. The executor then re-hashes the
  *     rendered bodies and verifies them against the intent's
@@ -25,28 +31,21 @@ import type { ResolvedSendPayload, SendPayloadResolver } from "./ports.js";
  * Fail-closed rules (content-free reason codes, surfaced via
  * TransportError.context.reason and classified by the executor as
  * failed_before_delivery — non-retryable, zero SMTP bytes):
- *  - `attachments_unsupported`      — the intent declares attachments. The
- *    worker has NO Supabase Storage client, so attachment BYTES are
- *    unreachable; Gate G specifies zero attachments, and attachment streaming
- *    is a separately-authorized later step. (The executor's manifestEqual
- *    check independently keeps guarding payload-vs-intent.)
- *  - `draft_revision_snapshot_missing` — no snapshot exists for the exact
- *    confirmed revision. Snapshots are checkpoints, not guaranteed per
- *    revision; a near-miss revision is NEVER substituted (specified behavior).
- *  - `draft_version_unreadable`     — the snapshot SELECT itself failed. The
- *    canonical migrations currently grant transport_worker NO SELECT on
- *    public.draft_versions, so this is the expected production outcome until
- *    a future additive UI grant migration lands (see DraftVersionRepository).
- *  - `draft_version_scope_mismatch` — a returned row does not match the
- *    intent's workspace/draft/revision (impossible via the WHERE clause;
- *    asserted anyway — defense in depth).
+ *  - `attachments_unsupported` — the intent declares attachments. The worker
+ *    has NO Supabase Storage client, so attachment BYTES are unreachable; Gate
+ *    G specifies zero attachments, and attachment streaming is a
+ *    separately-authorized later step. Checked BEFORE any DB access.
+ *  - `snapshot_unavailable` — get_send_snapshot raised the uniform P0002
+ *    (missing intent, legacy proof-v1 / contract != 2, or a missing/inconsistent
+ *    bound snapshot) OR the accessor was otherwise unreadable. A single
+ *    non-disclosing code: the worker cannot tell which check failed, by design.
  *  - `draft_body_bounds_exceeded` / `draft_render_failed` — the snapshot body
  *    violates the 1 MiB bound or the canonical node/mark subset.
  */
 export class DraftVersionSendPayloadResolver implements SendPayloadResolver {
   public constructor(
     private readonly deps: {
-      draftVersions: DraftVersionReader;
+      sendSnapshots: SendSnapshotReader;
     },
   ) {}
 
@@ -56,32 +55,20 @@ export class DraftVersionSendPayloadResolver implements SendPayloadResolver {
       throw this.refuse("attachments_unsupported");
     }
 
-    let row: DraftVersionRow | null;
+    let snapshot;
     try {
-      row = await this.deps.draftVersions.findDraftVersion(
-        intent.workspaceId,
-        intent.draftId,
-        intent.draftRevision,
-      );
+      // Resolve by send_intent_id ONLY. The private function returns the exact
+      // bound snapshot or raises a uniform P0002 (mapped to a content-free
+      // SnapshotUnavailableError by the repository). Any failure here — missing,
+      // legacy, inconsistent, or unreadable — is a single fail-closed outcome.
+      snapshot = await this.deps.sendSnapshots.getSendSnapshot(intent.id);
     } catch {
-      // Content-free: the underlying driver error (which may name columns) is
-      // deliberately NOT propagated or logged here.
-      throw this.refuse("draft_version_unreadable");
-    }
-    if (row === null) {
-      throw this.refuse("draft_revision_snapshot_missing");
-    }
-    if (
-      row.workspaceId !== intent.workspaceId ||
-      row.draftId !== intent.draftId ||
-      row.sourceRevision !== intent.draftRevision
-    ) {
-      throw this.refuse("draft_version_scope_mismatch");
+      throw this.refuse("snapshot_unavailable");
     }
 
     let rendered: { html: string; text: string };
     try {
-      rendered = renderDraftBody(row.bodyJson);
+      rendered = renderDraftBody(snapshot.bodyJson);
     } catch (err) {
       throw this.refuse(
         err instanceof TransportError && err.code === "mime_limit_exceeded"
@@ -94,7 +81,7 @@ export class DraftVersionSendPayloadResolver implements SendPayloadResolver {
     // verifyIntegrity re-checks revision, Message-ID, recipients, body hashes
     // and the attachment manifest — nothing here weakens that gate.
     return {
-      revision: row.sourceRevision,
+      revision: snapshot.sourceRevision,
       message: {
         messageId: intent.messageId,
         sender: intent.sender,

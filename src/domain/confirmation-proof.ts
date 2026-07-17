@@ -49,6 +49,12 @@ export function pgJsonbCanonical(value: JsonValue): string {
  * Build the canonical snapshot object exactly as the SQL RPC does, then hash.
  * `draftRevision` is a jsonb number (bigint values here are within safe range
  * for the revision counter; represented as a number to match jsonb).
+ *
+ * Proof versions (server-owned; the intent carries `proofVersion`):
+ *   1 (legacy) — inputs only (the 15 fields below).
+ *   2 (Phase 3B) — the canonical ADDITIONALLY covers `proof_version` and the
+ *     exact `draft_version_id` snapshot reference, matching create_send_intent's
+ *     v2 canonical. jsonb re-sorts keys, so insertion order is irrelevant.
  */
 export function recomputeConfirmationProof(intent: SendIntentRow): string {
   const snapshot: { [k: string]: JsonValue } = {
@@ -68,6 +74,10 @@ export function recomputeConfirmationProof(intent: SendIntentRow): string {
     contract_version: intent.contractVersion,
     confirmed_by: intent.confirmedBy,
   };
+  if (intent.proofVersion === 2) {
+    snapshot.proof_version = 2;
+    snapshot.draft_version_id = intent.draftVersionId;
+  }
   const canonical = pgJsonbCanonical(snapshot);
   return createHash("sha256")
     .update(Buffer.from(canonical, "utf8"))

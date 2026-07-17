@@ -94,6 +94,9 @@ d("pg-boss 12.26.0 — REAL singleton semantics for sync dispatch keys", () => {
       folder: "INBOX",
       mode: "incremental",
       syncRequestId,
+      // Fencing tuple stamped by the dispatcher (generation 1 for a fresh claim).
+      claimGeneration: 1,
+      claimToken: new Date(1_700_000_000_000).toISOString(),
     };
   }
 
@@ -143,7 +146,7 @@ d("pg-boss 12.26.0 — REAL singleton semantics for sync dispatch keys", () => {
     const second = await queues.enqueueSyncContinuation(job);
     expect(first).not.toBeNull();
     expect(second).toBeNull();
-    const key = singletonKeys.syncRequestContinuation(requestId, "400");
+    const key = singletonKeys.syncRequestContinuation(requestId, 1, "400");
     const r = await admin.query<{ n: number }>(
       `select count(*)::int as n from ${BOSS_SCHEMA}.job where singleton_key = $1`,
       [key],
@@ -242,7 +245,8 @@ d(
         leaseCutoff: new Date(now.getTime() - 300_000),
         maxAttempts: 5,
       });
-      expect(claimed.some((r) => r.id === requestId)).toBe(true);
+      const mine = claimed.find((r) => r.id === requestId);
+      expect(mine).toBeDefined();
 
       const statuses: string[] = [];
       // Scripted batches against the REAL message store: batch 3 re-persists
@@ -289,6 +293,10 @@ d(
         folder: "INBOX",
         mode: "initial",
         syncRequestId: requestId,
+        // The fencing tuple the dispatcher would stamp: the claim's generation
+        // (attempt_count) and token (claimed_at), carried on the job payload.
+        claimGeneration: mine!.attemptCount,
+        claimToken: mine!.claimedAt!.toISOString(),
       };
       const deps = makeDeps({
         repo,
@@ -303,7 +311,7 @@ d(
       expect(midway?.status).toBe("claimed"); // non-terminal after batches 1..2
       expect(midway?.completedAt).toBeNull();
 
-      const key = singletonKeys.syncRequestContinuation(requestId, "4");
+      const key = singletonKeys.syncRequestContinuation(requestId, 1, "4");
       const contRow = await admin.query<{ data: SyncMailboxJob }>(
         `select data from ${BOSS_SCHEMA}.job where singleton_key = $1`,
         [key],
@@ -349,26 +357,44 @@ d(
         leaseCutoff: new Date(now.getTime() - 300_000),
         maxAttempts: 5,
       });
-      const token = claimed.find((r) => r.id === requestId)!.claimedAt!;
+      const claimedRow = claimed.find((r) => r.id === requestId)!;
+      const gen = claimedRow.attemptCount;
+      const token = claimedRow.claimedAt!;
 
       const [a, b] = await Promise.all([
-        repoA.renewLease(requestId, token, new Date(now.getTime() + 1_000)),
-        repoB.renewLease(requestId, token, new Date(now.getTime() + 2_000)),
+        repoA.renewLease(
+          requestId,
+          gen,
+          token,
+          new Date(now.getTime() + 1_000),
+        ),
+        repoB.renewLease(
+          requestId,
+          gen,
+          token,
+          new Date(now.getTime() + 2_000),
+        ),
       ]);
-      // The CAS admits exactly one renewal for one token.
+      // The CAS admits exactly one renewal for one (generation, token).
       expect([a, b].filter((x) => x !== null)).toHaveLength(1);
       const winner = a !== null ? repoA : repoB;
       const loser = a !== null ? repoB : repoA;
+      const winnerToken = (a ?? b)!; // the new claimed_at the winning renew set
 
-      // The winner completes; the loser's late completion attempt is a no-op.
-      expect(await winner.markCompleted(requestId, new Date())).not.toBeNull();
-      expect(await loser.markCompleted(requestId, new Date())).toBeNull();
+      // The winner completes (fenced on its held token); the loser's late
+      // completion — still holding the stale token — is a no-op.
+      expect(
+        await winner.markCompleted(requestId, gen, winnerToken, new Date()),
+      ).not.toBeNull();
+      expect(
+        await loser.markCompleted(requestId, gen, token, new Date()),
+      ).toBeNull();
       expect((await repoA.getById(requestId))?.status).toBe("completed");
       // A renewal never consumed attempt budget.
       expect((await repoA.getById(requestId))?.attemptCount).toBe(1);
     });
 
-    it("lease expiry during backlog: reclaim + coexisting continuation job — one effective claimant, no false completion, no duplicate rows", async () => {
+    it("lease expiry during backlog: a superseded generation-1 job is fenced out before it opens IMAP; generation 2 completes", async () => {
       const ctx = await seedContext(admin);
       const folders = new FolderRepository(worker);
       const messages = new MessageRepository(worker);
@@ -382,27 +408,35 @@ d(
         uidnext: 1n,
       });
       const requestId = await requestSync(admin, ctx);
+
+      // Generation 1: the first (about-to-stall) claimant.
       const t0 = new Date();
-      await repo.claimBatch({
+      const firstClaim = await repo.claimBatch({
         limit: 50,
         now: t0,
         leaseCutoff: new Date(t0.getTime() - 300_000),
         maxAttempts: 5,
       });
+      const g1 = firstClaim.find((r) => r.id === requestId)!;
+      expect(g1.attemptCount).toBe(1);
 
-      // A continuation job from the (about to stall) first claimant is queued...
+      // A continuation job from the generation-1 claimant is queued (payload
+      // carries generation 1)...
       const contId = await queues.enqueueSyncContinuation({
         workspaceId: ctx.workspaceId,
         mailboxId: ctx.mailboxId,
         folder: "INBOX",
         mode: "incremental",
         syncRequestId: requestId,
+        claimGeneration: g1.attemptCount,
+        claimToken: g1.claimedAt!.toISOString(),
         cursorUid: "2",
       });
       expect(contId).not.toBeNull();
 
       // ...then the lease expires (crash simulation) and the dispatcher path
-      // reclaims: attempt_count += 1, fresh claimed_at, original key re-dispatch.
+      // reclaims into generation 2: attempt_count += 1, fresh claimed_at, and a
+      // NEW generation-scoped key re-dispatch.
       await admin.query(
         `update transport.sync_requests
           set claimed_at = now() - interval '10 minutes' where id = $1`,
@@ -415,39 +449,35 @@ d(
         leaseCutoff: new Date(t1.getTime() - 300_000),
         maxAttempts: 5,
       });
-      const mine = reclaimed.find((r) => r.id === requestId);
-      expect(mine?.attemptCount).toBe(2);
+      const g2 = reclaimed.find((r) => r.id === requestId)!;
+      expect(g2.attemptCount).toBe(2);
       const redispatch = await queues.enqueueSyncForRequest({
         workspaceId: ctx.workspaceId,
         mailboxId: ctx.mailboxId,
         folder: "INBOX",
         mode: "incremental",
         syncRequestId: requestId,
+        claimGeneration: g2.attemptCount,
+        claimToken: g2.claimedAt!.toISOString(),
       });
-      expect(redispatch).not.toBeNull(); // BOTH jobs now exist in pg-boss.
+      expect(redispatch).not.toBeNull(); // BOTH generation keys now exist.
 
-      // Both jobs run concurrently. Each persists the SAME backlog (idempotent
-      // upsert) and needs a mid-loop renewal; the claimed_at CAS admits ONE.
+      // Actor A carries the generation-1 payload; Actor B the generation-2 one.
+      // A's FIRST pre-batch ownership assert (renewLease CAS) fails on the
+      // generation mismatch, so A stops WITHOUT executing — it never opens IMAP.
+      // B owns the request: it drives the backlog to completion.
       const logsA: string[] = [];
       const logsB: string[] = [];
-      let waiting: (() => void) | null = null;
-      const barrier = (): Promise<void> =>
-        new Promise((resolve) => {
-          if (waiting === null) {
-            waiting = resolve; // first arrival parks until the second arrives
-          } else {
-            waiting();
-            resolve();
-          }
-        });
-      const scripted = (): (() => Promise<SyncResult>) => {
-        let n = 0; // per-actor batch counter
+      let executedA = 0;
+      let executedB = 0;
+      const scriptedB = (): (() => Promise<SyncResult>) => {
+        let n = 0;
         return async (): Promise<SyncResult> => {
+          executedB += 1;
           n += 1;
           if (n === 1) {
             await persist(messages, ctx, folder.id, 1n);
             await persist(messages, ctx, folder.id, 2n);
-            await barrier(); // both actors finish batch 1 before either renews
             return {
               persisted: 2,
               uidValidityChanged: false,
@@ -463,16 +493,26 @@ d(
           };
         };
       };
-      const jobData: SyncMailboxJob = {
+      const jobDataA: SyncMailboxJob = {
         workspaceId: ctx.workspaceId,
         mailboxId: ctx.mailboxId,
         folder: "INBOX",
         mode: "incremental",
         syncRequestId: requestId,
+        claimGeneration: g1.attemptCount,
+        claimToken: g1.claimedAt!.toISOString(),
+      };
+      const jobDataB: SyncMailboxJob = {
+        ...jobDataA,
+        claimGeneration: g2.attemptCount,
+        claimToken: g2.claimedAt!.toISOString(),
       };
       const depsA = makeDeps({
         repo,
-        execute: scripted(),
+        execute: () => {
+          executedA += 1;
+          return Promise.reject(new Error("generation-1 must not execute"));
+        },
         clock: fixedClock(Date.now() + 10_000),
         logLines: logsA,
         maxBatchesPerJob: 5,
@@ -481,28 +521,28 @@ d(
         repo: new SyncRequestRepository(
           new PgDatabase({ connectionString: WORKER_URL }),
         ),
-        execute: scripted(),
+        execute: scriptedB(),
         clock: fixedClock(Date.now() + 20_000),
         logLines: logsB,
         maxBatchesPerJob: 5,
       });
-      // Neither throws: the loser stops silently, the winner completes.
+      // Neither throws: the superseded actor stops silently, the owner completes.
       await Promise.all([
-        runSyncJob(depsA, jobData, { finalAttempt: false }),
-        runSyncJob(depsB, jobData, { finalAttempt: false }),
+        runSyncJob(depsA, jobDataA, { finalAttempt: false }),
+        runSyncJob(depsB, jobDataB, { finalAttempt: false }),
       ]);
 
       const done = await repo.getById(requestId);
       expect(done?.status).toBe("completed");
       expect(done?.completedAt).not.toBeNull();
-      // Exactly one actor lost its lease mid-loop (single effective claimant).
-      const leaseLost = [...logsA, ...logsB].filter((l) =>
-        l.includes("sync_lease_lost"),
-      );
-      expect(leaseLost).toHaveLength(1);
+      // The generation-1 actor was fenced out BEFORE its first batch (no IMAP).
+      expect(executedA).toBe(0);
+      expect(executedB).toBeGreaterThanOrEqual(1);
+      expect(logsA.some((l) => l.includes("sync_lease_lost"))).toBe(true);
+      expect(logsB.some((l) => l.includes("sync_lease_lost"))).toBe(false);
       // Renewals/continuations never consumed the failure budget.
       expect(done?.attemptCount).toBe(2);
-      // Idempotent upsert: the doubly-executed backlog persisted exactly once.
+      // Only generation 2 persisted the backlog — exactly once.
       expect(await messages.countByFolder(folder.id)).toBe(2);
     });
   },

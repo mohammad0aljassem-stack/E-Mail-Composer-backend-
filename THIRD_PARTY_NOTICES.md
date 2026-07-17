@@ -49,7 +49,7 @@ AGPL/GPL/LGPL/SSPL/BUSL/unknown license.
   policy; AGPL is not.
 - The canonical database schema is owned by the sibling UI repository
   (`E-Mail-Composer-UI`) at merged commit
-  `44c62c630b1db6bbdbcf5c95863bd3b896a77c99`. The backend pins that contract
+  `4bca2fc927c552f6466d9e8124e9b07c9770d1c1`. The backend pins that contract
   through a single source of truth,
   `config/canonical-transport-contract.lock.json`, which records the UI commit
   SHA, the manifest path, the manifest `sha256`, and the supported versions. The

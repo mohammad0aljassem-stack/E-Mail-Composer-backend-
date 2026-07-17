@@ -30,6 +30,14 @@
 //      validator public.phase3_send_attempt_transition_ok(text,text)
 //   8  forbiddenFunctionPrivileges / forbiddenTablePrivileges carry the
 //      browser-role EXECUTE and worker INSERT+DELETE denials (structural)
+//   8b (v2) requiredFunctionPrivileges grant transport_worker EXECUTE on the
+//      three private v2 accessors — transport.get_send_snapshot(uuid),
+//      transport.get_mirror_snapshot(uuid,uuid,bigint) and
+//      transport.create_or_verify_send_mime_artifact(uuid,uuid,uuid,text,text,
+//      bigint,bytea) — and forbid every browser role EXECUTE on all three.
+//   8c (v2) requiredTablePrivileges for transport.send_mime_artifacts is
+//      EXACTLY [SELECT, UPDATE] for the worker, and forbiddenTablePrivileges
+//      denies it INSERT + DELETE (no forged/destroyed artifact rows).
 //   9  protectedPrivateSchemas includes "transport"
 //   10 backend QUEUE names (src/queues/queue-config.ts) === manifest queue names
 //   11 QUEUE_DEFINITIONS[send_message].retryLimit === 0
@@ -48,8 +56,15 @@
 //       parser is the single source of truth for these runtime controls and
 //       the fail-closed default is enforced HERE.
 //   15b durable multi-batch lifecycle: SyncRequestRepository.renewLease
-//       exists and is a fenced CAS (status = 'claimed' AND claimed_at =
-//       <held token>) so at most one claimant is ever effective.
+//       exists and is a fenced DUAL-TOKEN CAS (status = 'claimed' AND
+//       attempt_count = <held generation> AND claimed_at = <held token>) so
+//       at most one claimant is ever effective across reclaims.
+//   15c/15d the TERMINAL transitions markCompleted / markFailed are fenced on
+//       the same (status='claimed', attempt_count, claimed_at) tuple, so a
+//       superseded generation can never complete or fail a reclaimed request.
+//   15e the durable sync-request singleton keys (syncRequest,
+//       syncRequestContinuation) are GENERATION-SCOPED (contain ":gen:") so a
+//       reclaim's job never dedup-collides with a superseded generation's.
 //   16  read-only executor modules (sync / mutation / draft-mirror /
 //       sync-request dispatcher) neither import nor construct the SMTP
 //       client (NodemailerSmtpClient) — a read-only sync can never carry
@@ -72,6 +87,16 @@ const LOCK_PATH = join(
 const VALIDATOR = "public.phase3_send_attempt_transition_ok(text,text)";
 const WORKER_ROLE = "transport_worker";
 const BROWSER_ROLES = ["public", "anon", "authenticated"];
+
+// Phase 3B (contract v2) private worker accessors + the exact-MIME artifact
+// table the worker persists before any SMTP byte. These are additive to the
+// v1 boundary and are required, fail-closed, EXECUTE grants for the worker.
+const V2_WORKER_FUNCTIONS = [
+  "transport.get_send_snapshot(uuid)",
+  "transport.get_mirror_snapshot(uuid,uuid,bigint)",
+  "transport.create_or_verify_send_mime_artifact(uuid,uuid,uuid,text,text,bigint,bytea)",
+];
+const MIME_ARTIFACT_TABLE = "transport.send_mime_artifacts";
 
 const errors = [];
 const fail = (msg) => errors.push(msg);
@@ -266,6 +291,89 @@ if (manifest !== null) {
     }
   }
 
+  // --- 8b. requiredFunctionPrivileges: worker EXECUTE on the v2 private
+  //         snapshot accessors + the exact-MIME artifact function (fail-closed;
+  //         the worker's ONLY read path for confirmed content and its ONLY
+  //         write path for the pre-SMTP MIME artifact are these DEFINER fns). --
+  for (const fn of V2_WORKER_FUNCTIONS) {
+    const present = reqFn.some(
+      (p) =>
+        p &&
+        p.function === fn &&
+        p.privilege === "EXECUTE" &&
+        p.grantee === WORKER_ROLE,
+    );
+    if (!present) {
+      fail(
+        `[8b] requiredFunctionPrivileges must grant ${WORKER_ROLE} EXECUTE on ${fn}.`,
+      );
+    }
+  }
+  // The same three functions must be forbidden to every browser role.
+  for (const fn of V2_WORKER_FUNCTIONS) {
+    for (const role of BROWSER_ROLES) {
+      const present = forbFn.some(
+        (p) =>
+          p &&
+          p.function === fn &&
+          p.privilege === "EXECUTE" &&
+          p.grantee === role,
+      );
+      if (!present) {
+        fail(
+          `[8b] forbiddenFunctionPrivileges must forbid ${role} EXECUTE on ${fn}.`,
+        );
+      }
+    }
+  }
+
+  // --- 8c. transport.send_mime_artifacts privilege boundary. The worker holds
+  //         EXACTLY [SELECT, UPDATE] (create/verify is via the DEFINER fn; the
+  //         retention-clearing UPDATE is direct) and is FORBIDDEN INSERT/DELETE
+  //         so it can never forge or destroy an artifact row. -----------------
+  const reqTbl = Array.isArray(manifest.requiredTablePrivileges)
+    ? manifest.requiredTablePrivileges
+    : [];
+  const mimeRequired = reqTbl.find(
+    (t) =>
+      t &&
+      t.table === MIME_ARTIFACT_TABLE &&
+      t.grantee === WORKER_ROLE &&
+      Array.isArray(t.privileges),
+  );
+  if (!mimeRequired) {
+    fail(
+      `[8c] requiredTablePrivileges must carry a ${MIME_ARTIFACT_TABLE} entry for ${WORKER_ROLE}.`,
+    );
+  } else {
+    const got = [...mimeRequired.privileges].sort().join(",");
+    if (got !== "SELECT,UPDATE") {
+      fail(
+        `[8c] requiredTablePrivileges for ${WORKER_ROLE} on ${MIME_ARTIFACT_TABLE} must be exactly [SELECT, UPDATE]; found [${got}].`,
+      );
+    }
+  }
+  const mimeForbidden = forbTbl.find(
+    (t) =>
+      t &&
+      t.table === MIME_ARTIFACT_TABLE &&
+      t.grantee === WORKER_ROLE &&
+      Array.isArray(t.privileges),
+  );
+  if (!mimeForbidden) {
+    fail(
+      `[8c] forbiddenTablePrivileges must carry a ${MIME_ARTIFACT_TABLE} entry for ${WORKER_ROLE}.`,
+    );
+  } else {
+    for (const priv of ["INSERT", "DELETE"]) {
+      if (!mimeForbidden.privileges.includes(priv)) {
+        fail(
+          `[8c] forbiddenTablePrivileges for ${WORKER_ROLE} on ${MIME_ARTIFACT_TABLE} must include ${priv}.`,
+        );
+      }
+    }
+  }
+
   // --- 9. protectedPrivateSchemas includes "transport" ---------------------
   const protectedSchemas = Array.isArray(manifest.protectedPrivateSchemas)
     ? manifest.protectedPrivateSchemas
@@ -396,9 +504,10 @@ for (const hit of scanAuditPolling()) {
     );
   }
 
-  // 15b (Phase 3B): fenced lease renewal for multi-batch claims — renewLease
-  // must exist and its SQL must be a claimed_at CAS guarded on status='claimed'
-  // (single-claimant guarantee without any schema change).
+  // 15b (Phase 3B / Phase 4): fenced lease renewal for multi-batch claims —
+  // renewLease must exist and its SQL must be a two-part CAS guarded on
+  // status='claimed' AND attempt_count = <generation> AND claimed_at = <token>
+  // (single-claimant guarantee across reclaims, without any schema change).
   const renew = /async\s+renewLease\s*\([\s\S]{0,900}?returning/i.exec(repos);
   if (renew === null) {
     fail(
@@ -410,9 +519,68 @@ for (const hit of scanAuditPolling()) {
         "[15b] renewLease SQL must be guarded on status = 'claimed' (CAS shape).",
       );
     }
-    if (!/where[\s\S]*?claimed_at\s*=\s*\$\d/i.test(renew[0])) {
+    if (!/claimed_at\s*=\s*\$\d/i.test(renew[0])) {
       fail(
         "[15b] renewLease SQL must CAS on claimed_at = <held token> in its WHERE clause.",
+      );
+    }
+    if (!/attempt_count\s*=\s*\$\d/i.test(renew[0])) {
+      fail(
+        "[15b] renewLease SQL must fence on attempt_count = <held generation> (dual-token fencing).",
+      );
+    }
+  }
+
+  // 15c/15d (Phase 4): the TERMINAL transitions must be generation+token
+  // fenced too — a superseded claimant must never complete or fail a request
+  // another generation already took over. Both markCompleted and markFailed
+  // must CAS on status='claimed' AND attempt_count = $ AND claimed_at = $.
+  for (const [tag, name] of [
+    ["15c", "markCompleted"],
+    ["15d", "markFailed"],
+  ]) {
+    const re = new RegExp(
+      `async\\s+${name}\\s*\\([\\s\\S]{0,1100}?returning`,
+      "i",
+    );
+    const m = re.exec(repos);
+    if (m === null) {
+      fail(
+        `[${tag}] SyncRequestRepository.${name} is missing from repositories.`,
+      );
+      continue;
+    }
+    if (!/status\s*=\s*'claimed'/i.test(m[0])) {
+      fail(`[${tag}] ${name} SQL must be guarded on status = 'claimed'.`);
+    }
+    if (!/attempt_count\s*=\s*\$\d/i.test(m[0])) {
+      fail(
+        `[${tag}] ${name} SQL must fence on attempt_count = <expected generation>.`,
+      );
+    }
+    if (!/claimed_at\s*=\s*\$\d/i.test(m[0])) {
+      fail(`[${tag}] ${name} SQL must fence on claimed_at = <expected token>.`);
+    }
+  }
+
+  // 15e (Phase 4): the durable sync-request singleton keys must be
+  // GENERATION-SCOPED (contain :gen:) so a reclaim's job never collides with a
+  // superseded generation's still-queued job (and vice versa).
+  const qcfg = readText("src/queues/queue-config.ts");
+  for (const [tag, fn] of [
+    ["15e", "syncRequest"],
+    ["15e", "syncRequestContinuation"],
+  ]) {
+    const body = new RegExp(`${fn}\\s*:\\s*\\([^)]*\\)[^\`]*\`([^\`]*)\``).exec(
+      qcfg,
+    );
+    if (body === null) {
+      fail(
+        `[${tag}] singletonKeys.${fn} template not found in queue-config.ts.`,
+      );
+    } else if (!/:gen:\$\{/.test(body[1])) {
+      fail(
+        `[${tag}] singletonKeys.${fn} must be generation-scoped (include ":gen:\${...}"). Found \`${body[1]}\`.`,
       );
     }
   }
@@ -593,9 +761,11 @@ function report() {
       `  manifest: ${lock.manifestPath} (sha256 ${lock.manifestSha256})\n` +
       `  versions: manifestSchema=${lock.supportedManifestSchemaVersion}, ` +
       `transportContract=${lock.supportedTransportContractVersion}\n` +
-      "  checks 1–16 (incl. 12b, 15b) passed (SHA, manifest hash, versions, migration " +
-      "checksums, privilege/queue/flag boundaries, capability-flag defaults, " +
-      "sync lease CAS, static regression scans).",
+      "  checks 1–16 (incl. 8b, 8c, 12b, 15b–15e) passed (SHA, manifest hash, versions, " +
+      "migration checksums, privilege/queue/flag boundaries incl. the v2 private " +
+      "accessors + MIME-artifact table, capability-flag defaults, dual-token sync " +
+      "fencing CAS incl. terminal transitions + generation-scoped keys, static " +
+      "regression scans).",
   );
   process.exit(0);
 }

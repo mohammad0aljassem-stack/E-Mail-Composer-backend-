@@ -5,22 +5,22 @@ import { recomputeConfirmationProof } from "../../src/domain/confirmation-proof.
 import type { SendIntentRow } from "../../src/domain/models.js";
 import {
   DraftMirrorRepository,
-  DraftVersionRepository,
   FolderRepository,
   MessageRepository,
+  MimeArtifactRepository,
+  MirrorSnapshotRepository,
   SendAttemptRepository,
+  SendSnapshotRepository,
   WorkerClaimRepository,
 } from "../../src/db/repositories.js";
 import { PgDatabase } from "../../src/db/pool.js";
 import { renderDraftBody } from "../../src/mime/draft-renderer.js";
-import { DraftVersionSendPayloadResolver } from "../../src/workers/send-payload-resolver.js";
 import {
-  HAS_DB,
-  seedContext,
-  superuserPool,
-  SUPERUSER_URL,
-  WORKER_URL,
-} from "./helpers.js";
+  buildOutboundMime,
+  sha256Hex,
+} from "../../src/mime/outbound-builder.js";
+import { DraftVersionSendPayloadResolver } from "../../src/workers/send-payload-resolver.js";
+import { HAS_DB, seedContext, superuserPool, WORKER_URL } from "./helpers.js";
 
 const d = HAS_DB ? describe : describe.skip;
 
@@ -245,126 +245,391 @@ d("message dedupe + draft mirror guard (real DB)", () => {
   });
 });
 
-d("draft_versions snapshot access (Phase 3B C4, real grants)", () => {
+d(
+  "confirmed-send snapshot access via the private function (v2, real grants)",
+  () => {
+    let admin: pg.Pool;
+    let worker: PgDatabase;
+    beforeAll(() => {
+      admin = superuserPool();
+      worker = new PgDatabase({ connectionString: WORKER_URL });
+    });
+    afterAll(async () => {
+      await worker.end();
+      await admin.end();
+    });
+
+    const SNAPSHOT_DOC = {
+      type: "doc",
+      content: [
+        {
+          type: "paragraph",
+          content: [{ type: "text", text: "integration snapshot body" }],
+        },
+      ],
+    };
+
+    /**
+     * Seed a fully-formed v2 confirmation directly (as superuser): an immutable
+     * draft_versions snapshot + a send_intent bound to it by the composite
+     * identity FK, with proof_version = 2 / contract_version = 2. Mirrors exactly
+     * what create_send_intent writes, so transport.get_send_snapshot accepts it.
+     */
+    async function seedV2Intent(ctx: {
+      workspaceId: string;
+      mailboxId: string;
+      draftId: string;
+      userId: string;
+    }): Promise<{ intentId: string; draftVersionId: string }> {
+      const dv = await admin.query<{ id: string }>(
+        `insert into public.draft_versions
+         (workspace_id, draft_id, version_no, source_revision, subject,
+          body_json, reason, created_by)
+       values ($1,$2,1,1,'subject',$3::jsonb,'send_confirmation',$4)
+       returning id`,
+        [
+          ctx.workspaceId,
+          ctx.draftId,
+          JSON.stringify(SNAPSHOT_DOC),
+          ctx.userId,
+        ],
+      );
+      const draftVersionId = dv.rows[0]!.id;
+      const intent = await admin.query<{ id: string }>(
+        `insert into public.send_intents
+         (workspace_id, mailbox_id, draft_id, draft_revision, sender, recipients,
+          subject, message_id, idempotency_key, confirmed_by, confirmation_proof,
+          contract_version, draft_version_id, proof_version)
+       values ($1,$2,$3,1,'sender@test.local',
+               '{"to":["r@test.local"]}'::jsonb,'subject',$4,$5,$6,$7,2,$8,2)
+       returning id`,
+        [
+          ctx.workspaceId,
+          ctx.mailboxId,
+          ctx.draftId,
+          messageId(),
+          `idem-${randomUUID()}`,
+          ctx.userId,
+          "a".repeat(64),
+          draftVersionId,
+        ],
+      );
+      return { intentId: intent.rows[0]!.id, draftVersionId };
+    }
+
+    function intentFor(
+      ctx: {
+        workspaceId: string;
+        mailboxId: string;
+        draftId: string;
+        userId: string;
+      },
+      intentId: string,
+    ): SendIntentRow {
+      return {
+        id: intentId,
+        workspaceId: ctx.workspaceId,
+        mailboxId: ctx.mailboxId,
+        draftId: ctx.draftId,
+        draftRevision: 1n,
+        sender: "sender@test.local",
+        recipients: { to: ["r@test.local"] },
+        subject: "subject",
+        htmlHash: null,
+        textHash: null,
+        attachmentManifest: [],
+        messageId: messageId(),
+        idempotencyKey: `idem-${randomUUID()}`,
+        templateVersionId: null,
+        signatureId: null,
+        confirmedBy: ctx.userId,
+        confirmationProof: "a".repeat(64),
+        contractVersion: 2,
+        proofVersion: 2,
+        draftVersionId: null,
+      };
+    }
+
+    // The worker has NO table grant on public.draft_versions — it reads confirmed
+    // content ONLY through the private SECURITY DEFINER accessor. This negative
+    // guard pins that a direct SELECT is denied (42501) even though the accessor
+    // works (next test).
+    it("transport_worker has NO direct SELECT on public.draft_versions (42501)", async () => {
+      try {
+        await worker.query(`select id from public.draft_versions limit 1`);
+        expect.unreachable("worker SELECT on draft_versions should be denied");
+      } catch (err) {
+        expect((err as { code?: string }).code).toBe("42501");
+      }
+    });
+
+    it("the WORKER role CAN execute transport.get_send_snapshot with NO test-only grant", async () => {
+      const ctx = await seedContext(admin);
+      const { intentId, draftVersionId } = await seedV2Intent(ctx);
+      // Executes as the least-privileged worker login — the only grant is the
+      // canonical EXECUTE from migration 20260716100000.
+      const repo = new SendSnapshotRepository(worker);
+      const snap = await repo.getSendSnapshot(intentId);
+      expect(snap.draftVersionId).toBe(draftVersionId);
+      expect(snap.workspaceId).toBe(ctx.workspaceId);
+      expect(snap.draftId).toBe(ctx.draftId);
+      expect(snap.sourceRevision).toBe(1n);
+      expect(snap.subject).toBe("subject");
+      expect(snap.bodyJson).toEqual(SNAPSHOT_DOC);
+    });
+
+    it("send happy path resolves via the function under the worker role", async () => {
+      const ctx = await seedContext(admin);
+      const { intentId } = await seedV2Intent(ctx);
+      const resolver = new DraftVersionSendPayloadResolver({
+        sendSnapshots: new SendSnapshotRepository(worker),
+      });
+      const payload = await resolver.resolve(intentFor(ctx, intentId));
+      expect(payload.revision).toBe(1n);
+      const rendered = renderDraftBody(SNAPSHOT_DOC);
+      expect(payload.message.html).toBe(rendered.html);
+      expect(payload.message.text).toBe(rendered.text);
+      expect(payload.message.attachments).toEqual([]);
+    });
+
+    it("a legacy (proof-v1) intent is non-sendable: uniform P0002 → snapshot_unavailable", async () => {
+      const ctx = await seedContext(admin);
+      // Legacy shape: no draft_version_id, proof_version/contract_version default 1.
+      const legacy = await admin.query<{ id: string }>(
+        `insert into public.send_intents
+         (workspace_id, mailbox_id, draft_id, draft_revision, sender, recipients,
+          subject, message_id, idempotency_key, confirmed_by, confirmation_proof)
+       values ($1,$2,$3,1,'sender@test.local',
+               '{"to":["r@test.local"]}'::jsonb,'subject',$4,$5,$6,$7)
+       returning id`,
+        [
+          ctx.workspaceId,
+          ctx.mailboxId,
+          ctx.draftId,
+          messageId(),
+          `idem-${randomUUID()}`,
+          ctx.userId,
+          "a".repeat(64),
+        ],
+      );
+      const repo = new SendSnapshotRepository(worker);
+      await expect(
+        repo.getSendSnapshot(legacy.rows[0]!.id),
+      ).rejects.toMatchObject({ code: "snapshot_unavailable" });
+      // And a wholly unknown intent id fails identically (indistinguishable).
+      await expect(repo.getSendSnapshot(randomUUID())).rejects.toMatchObject({
+        code: "snapshot_unavailable",
+      });
+    });
+
+    it("the WORKER role CAN execute transport.get_mirror_snapshot; missing → P0002", async () => {
+      const ctx = await seedContext(admin);
+      await seedV2Intent(ctx); // also lands a draft_versions row at revision 1
+      const repo = new MirrorSnapshotRepository(worker);
+      const snap = await repo.getMirrorSnapshot(
+        ctx.workspaceId,
+        ctx.draftId,
+        1n,
+      );
+      expect(snap.subject).toBe("subject");
+      expect(snap.bodyJson).toEqual(SNAPSHOT_DOC);
+      await expect(
+        repo.getMirrorSnapshot(ctx.workspaceId, ctx.draftId, 999n),
+      ).rejects.toMatchObject({ code: "snapshot_unavailable" });
+    });
+  },
+);
+
+d("exact MIME artifacts (Phase 6, real v2 schema + worker grants)", () => {
   let admin: pg.Pool;
-  let adminDb: PgDatabase;
   let worker: PgDatabase;
   beforeAll(() => {
     admin = superuserPool();
-    adminDb = new PgDatabase({ connectionString: SUPERUSER_URL });
     worker = new PgDatabase({ connectionString: WORKER_URL });
   });
   afterAll(async () => {
     await worker.end();
-    await adminDb.end();
     await admin.end();
   });
 
-  const SNAPSHOT_DOC = {
-    type: "doc",
-    content: [
-      {
-        type: "paragraph",
-        content: [{ type: "text", text: "integration snapshot body" }],
-      },
-    ],
-  };
-
-  async function seedVersion(ctx: {
-    workspaceId: string;
-    draftId: string;
-    userId: string;
-  }): Promise<void> {
-    await admin.query(
-      `insert into public.draft_versions
-         (workspace_id, draft_id, version_no, source_revision, subject,
-          body_json, reason, created_by)
-       values ($1,$2,1,1,'subject',$3::jsonb,'manual_checkpoint',$4)`,
-      [ctx.workspaceId, ctx.draftId, JSON.stringify(SNAPSHOT_DOC), ctx.userId],
-    );
+  /** Move a fresh (confirmed) attempt to 'claimed' as the worker. */
+  async function claim(attemptId: string): Promise<bigint> {
+    const repo = new SendAttemptRepository(worker);
+    await repo.compareAndSet({
+      id: attemptId,
+      expectedVersion: 1n,
+      expectedState: "confirmed",
+      toState: "queued",
+    });
+    const claimed = await repo.compareAndSet({
+      id: attemptId,
+      expectedVersion: 2n,
+      expectedState: "queued",
+      toState: "claimed",
+      fields: { claimedBy: "w-int", claimedAt: new Date() },
+    });
+    if (claimed === null) throw new Error("claim failed");
+    return claimed.version;
   }
 
-  function intentFor(ctx: {
-    workspaceId: string;
-    mailboxId: string;
-    draftId: string;
-    userId: string;
-  }): SendIntentRow {
-    return {
-      id: randomUUID(),
-      workspaceId: ctx.workspaceId,
-      mailboxId: ctx.mailboxId,
-      draftId: ctx.draftId,
-      draftRevision: 1n,
+  async function buildMimeFor(mId: string): Promise<Buffer> {
+    const built = await buildOutboundMime({
+      messageId: mId,
       sender: "sender@test.local",
       recipients: { to: ["r@test.local"] },
-      subject: "subject",
-      htmlHash: null,
-      textHash: null,
-      attachmentManifest: [],
-      messageId: messageId(),
-      idempotencyKey: `idem-${randomUUID()}`,
-      templateVersionId: null,
-      signatureId: null,
-      confirmedBy: ctx.userId,
-      confirmationProof: "a".repeat(64),
-      contractVersion: 1,
-    };
+      subject: "s",
+      html: "<p>hi</p>",
+      text: "hi",
+      attachments: [],
+    });
+    return built.raw;
   }
 
-  // DECISION PROBE: the canonical migrations grant transport_worker NO
-  // privilege on public.draft_versions (foundation grant block: mailboxes,
-  // send_intents, ... — draft_versions absent). Until a FUTURE additive
-  // UI-owned grant migration lands, the worker role cannot read snapshots and
-  // MAIL_SEND_ENABLED cannot deliver in a real environment. This test pins
-  // that reality; no grant is injected anywhere in this repo.
-  it("transport_worker has NO SELECT on public.draft_versions (42501)", async () => {
+  // claimed -> createOrVerify (worker EXECUTE, no test-only grant) -> the
+  // claimed -> smtp_in_progress transition then SUCCEEDS with the artifact.
+  it("createOrVerify while claimed permits claimed -> smtp_in_progress", async () => {
+    const ctx = await seedContext(admin);
+    const { attemptId, messageId: mId } = await seedIntentAndAttempt(
+      admin,
+      ctx,
+    );
+    const intentId = (
+      await admin.query<{ send_intent_id: string }>(
+        `select send_intent_id from public.send_attempts where id = $1`,
+        [attemptId],
+      )
+    ).rows[0]!.send_intent_id;
+    const version = await claim(attemptId);
+    const raw = await buildMimeFor(mId);
+
+    const repo = new MimeArtifactRepository(worker);
+    const artifact = await repo.createOrVerify({
+      sendAttemptId: attemptId,
+      sendIntentId: intentId,
+      workspaceId: ctx.workspaceId,
+      messageId: mId,
+      mimeSha256: sha256Hex(raw),
+      sizeBytes: BigInt(raw.length),
+      rawMime: raw,
+    });
+    expect(artifact.rawMime).not.toBeNull();
+    expect(artifact.rawMime!.equals(raw)).toBe(true);
+    expect(artifact.mimeSha256).toBe(sha256Hex(raw));
+
+    // The DB ordering guard now passes because a valid retained artifact exists.
+    const moved = await new SendAttemptRepository(worker).compareAndSet({
+      id: attemptId,
+      expectedVersion: version,
+      expectedState: "claimed",
+      toState: "smtp_in_progress",
+      fields: { messageId: mId },
+    });
+    expect(moved?.state).toBe("smtp_in_progress");
+
+    // An identical create-or-verify replay returns the SAME artifact row.
+    const replay = await repo.createOrVerify({
+      sendAttemptId: attemptId,
+      sendIntentId: intentId,
+      workspaceId: ctx.workspaceId,
+      messageId: mId,
+      mimeSha256: sha256Hex(raw),
+      sizeBytes: BigInt(raw.length),
+      rawMime: raw,
+    });
+    expect(replay.id).toBe(artifact.id);
+  });
+
+  // The DB guard trg_send_attempts_require_mime_before_smtp REJECTS the
+  // transition (23514) when NO artifact was persisted.
+  it("claimed -> smtp_in_progress WITHOUT an artifact is rejected 23514 by the DB", async () => {
+    const ctx = await seedContext(admin);
+    const { attemptId, messageId: mId } = await seedIntentAndAttempt(
+      admin,
+      ctx,
+    );
+    const version = await claim(attemptId);
+    await expect(
+      new SendAttemptRepository(worker).compareAndSet({
+        id: attemptId,
+        expectedVersion: version,
+        expectedState: "claimed",
+        toState: "smtp_in_progress",
+        fields: { messageId: mId },
+      }),
+    ).rejects.toMatchObject({ code: "23514" });
+    // The attempt is untouched — still claimable for a proper artifact-first run.
+    const still = await new SendAttemptRepository(worker).getById(attemptId);
+    expect(still?.state).toBe("claimed");
+  });
+
+  // The worker holds NO direct INSERT on transport.send_mime_artifacts: a direct
+  // INSERT is denied (42501) even while the attempt is claimed.
+  it("the worker CANNOT direct-INSERT into transport.send_mime_artifacts (42501)", async () => {
+    const ctx = await seedContext(admin);
+    const { attemptId, messageId: mId } = await seedIntentAndAttempt(
+      admin,
+      ctx,
+    );
+    const intentId = (
+      await admin.query<{ send_intent_id: string }>(
+        `select send_intent_id from public.send_attempts where id = $1`,
+        [attemptId],
+      )
+    ).rows[0]!.send_intent_id;
+    await claim(attemptId);
+    const raw = await buildMimeFor(mId);
     try {
-      await worker.query(`select id from public.draft_versions limit 1`);
-      expect.unreachable("worker SELECT on draft_versions should be denied");
+      await worker.query(
+        `insert into transport.send_mime_artifacts
+           (send_attempt_id, send_intent_id, workspace_id, message_id,
+            mime_sha256, size_bytes, raw_mime)
+         values ($1,$2,$3,$4,$5,$6,$7)`,
+        [
+          attemptId,
+          intentId,
+          ctx.workspaceId,
+          mId,
+          sha256Hex(raw),
+          raw.length,
+          raw,
+        ],
+      );
+      expect.unreachable("worker direct INSERT should be denied");
     } catch (err) {
       expect((err as { code?: string }).code).toBe("42501");
     }
   });
 
-  it("the resolver fails CLOSED (draft_version_unreadable) under the worker role", async () => {
+  // getBySendAttempt loads the EXACT stored bytes for the restart Sent append.
+  it("getBySendAttempt returns the exact retained bytes", async () => {
     const ctx = await seedContext(admin);
-    await seedVersion(ctx);
-    const resolver = new DraftVersionSendPayloadResolver({
-      draftVersions: new DraftVersionRepository(worker),
+    const { attemptId, messageId: mId } = await seedIntentAndAttempt(
+      admin,
+      ctx,
+    );
+    const intentId = (
+      await admin.query<{ send_intent_id: string }>(
+        `select send_intent_id from public.send_attempts where id = $1`,
+        [attemptId],
+      )
+    ).rows[0]!.send_intent_id;
+    await claim(attemptId);
+    const raw = await buildMimeFor(mId);
+    const repo = new MimeArtifactRepository(worker);
+    await repo.createOrVerify({
+      sendAttemptId: attemptId,
+      sendIntentId: intentId,
+      workspaceId: ctx.workspaceId,
+      messageId: mId,
+      mimeSha256: sha256Hex(raw),
+      sizeBytes: BigInt(raw.length),
+      rawMime: raw,
     });
-    await expect(resolver.resolve(intentFor(ctx))).rejects.toMatchObject({
-      name: "TransportError",
-      code: "send_precondition_failed",
-      context: { reason: "draft_version_unreadable" },
-    });
-  });
-
-  it("full resolver round-trip against the real schema via the service path", async () => {
-    // Proves the SELECT shape + jsonb rendering against the canonical schema.
-    // Runs over the superuser connection because the worker role's grant is a
-    // documented follow-up (see the probe above).
-    const ctx = await seedContext(admin);
-    await seedVersion(ctx);
-    const resolver = new DraftVersionSendPayloadResolver({
-      draftVersions: new DraftVersionRepository(adminDb),
-    });
-    const payload = await resolver.resolve(intentFor(ctx));
-    expect(payload.revision).toBe(1n);
-    const rendered = renderDraftBody(SNAPSHOT_DOC);
-    expect(payload.message.html).toBe(rendered.html);
-    expect(payload.message.text).toBe(rendered.text);
-    expect(payload.message.attachments).toEqual([]);
-  });
-
-  it("a missing exact-revision snapshot resolves to fail-closed (service path)", async () => {
-    const ctx = await seedContext(admin); // no draft_versions row seeded
-    const resolver = new DraftVersionSendPayloadResolver({
-      draftVersions: new DraftVersionRepository(adminDb),
-    });
-    await expect(resolver.resolve(intentFor(ctx))).rejects.toMatchObject({
-      context: { reason: "draft_revision_snapshot_missing" },
-    });
+    const loaded = await repo.getBySendAttempt(attemptId);
+    expect(loaded).not.toBeNull();
+    expect(loaded!.rawMime!.equals(raw)).toBe(true);
+    expect(loaded!.sizeBytes).toBe(BigInt(raw.length));
+    expect(sha256Hex(loaded!.rawMime!)).toBe(loaded!.mimeSha256);
   });
 });
 
@@ -403,11 +668,15 @@ d("confirmation-proof parity: SQL RPC vs TS re-derivation", () => {
         sender: string;
         draft_revision: string;
         contract_version: number;
+        proof_version: number;
+        draft_version_id: string;
       }>(
+        // v2: the confirmed subject MUST byte-match the locked draft subject
+        // (seedContext seeds 'subject'); p_contract_version defaults to 2.
         `select * from public.create_send_intent(
            $1,$2,$3, 1, $4,
            '{"to":["r@test.local"],"cc":["c@test.local"]}'::jsonb,
-           'Hello subject',
+           'subject',
            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
            null,
            '[{"filename":"a.txt","contentType":"text/plain","sizeBytes":3,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]'::jsonb
@@ -436,6 +705,8 @@ d("confirmation-proof parity: SQL RPC vs TS re-derivation", () => {
         confirmedBy: ctx.userId,
         confirmationProof: row.confirmation_proof,
         contractVersion: row.contract_version,
+        proofVersion: row.proof_version,
+        draftVersionId: row.draft_version_id,
       };
       const recomputed = recomputeConfirmationProof(intent);
       expect(recomputed).toBe(row.confirmation_proof);

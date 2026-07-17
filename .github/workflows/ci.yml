@@ -24,7 +24,7 @@ env:
   # contract:verify` asserts `git -C ui-schema rev-parse HEAD === lock.uiCommitSha`
   # and verifies every migration checksum against the checked-out manifest, so
   # there are no hand-copied checksum env vars any more (single source of truth).
-  UI_REPO_REF: "44c62c630b1db6bbdbcf5c95863bd3b896a77c99"
+  UI_REPO_REF: "4bca2fc927c552f6466d9e8124e9b07c9770d1c1"
 
 jobs:
   build-and-test:
